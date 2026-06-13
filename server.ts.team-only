@@ -1,0 +1,135 @@
+// ===== TEAM AGENTS =====
+
+// Create team agent
+app.post("/api/team-agents", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const { agent_name, role, personality, telegram_bot_token, bot_name, welcome_message } = req.body;
+
+    if (!agent_name) return res.status(400).json({ error: "Agent name required" });
+    if (!telegram_bot_token) return res.status(400).json({ error: "Telegram bot token required" });
+
+    // Check plan limits
+    const [subRows]: any = await db.execute(
+      "SELECT plan, status FROM aba_subscriptions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1", [userId]
+    );
+    const plan = subRows.length > 0 ? (subRows[0].plan || '').toLowerCase() : 'entry';
+    const maxAgents: Record<string, number> = { entry: 2, standard: 4, enterprise: 10 };
+    const limit = maxAgents[plan] || 2;
+
+    const [existing]: any = await db.execute(
+      "SELECT COUNT(*) as cnt FROM aba_team_agents WHERE user_id = ?", [userId]
+    );
+    const currentCount = existing[0]?.cnt || 0;
+
+    // +1 for the admin agent itself
+    if (currentCount + 1 >= limit) {
+      return res.status(400).json({ error: `Plan limit reached (${limit} agents). Upgrade to add more.` });
+    }
+
+    const result = await db.execute(
+      `INSERT INTO aba_team_agents (user_id, agent_name, role, personality, telegram_bot_token, bot_name, welcome_message)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [userId, agent_name, role || null, personality || 'Professional', telegram_bot_token, bot_name || '', welcome_message || '']
+    );
+
+    res.json({ success: true, id: (result as any)[0]?.insertId });
+  } catch (err: any) {
+    console.error("Create team agent error:", err);
+    if (err.code === 'ER_DUP_ENTRY') {
+      return res.status(400).json({ error: "A team agent with this Telegram bot token already exists" });
+    }
+    res.status(500).json({ error: "Failed to create team agent" });
+  }
+});
+
+// List team agents
+app.get("/api/team-agents", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const [rows]: any = await db.execute(
+      "SELECT id, agent_name, role, personality, telegram_bot_token, bot_name, welcome_message, created_at FROM aba_team_agents WHERE user_id = ? ORDER BY created_at ASC",
+      [userId]
+    );
+    res.json(rows);
+  } catch (err: any) {
+    console.error("List team agents error:", err);
+    res.status(500).json({ error: "Failed to fetch team agents" });
+  }
+});
+
+// Delete team agent
+app.delete("/api/team-agents/:id", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const result = await db.execute(
+      "DELETE FROM aba_team_agents WHERE id = ? AND user_id = ?",
+      [req.params.id, userId]
+    );
+    if ((result as any)[0]?.affectedRows === 0) {
+      return res.status(404).json({ error: "Team agent not found" });
+    }
+    res.json({ success: true });
+  } catch (err: any) {
+    console.error("Delete team agent error:", err);
+    res.status(500).json({ error: "Failed to delete team agent" });
+  }
+});
+
+// Apply team agents — rebuild openclaw config and restart
+app.post("/api/team-agents/apply", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+
+    // Get admin agent config
+    const [adminRows]: any = await db.execute("SELECT * FROM aba_agent_configs WHERE user_id = ?", [userId]);
+    const admin = adminRows[0];
+    if (!admin) return res.status(400).json({ error: "Admin agent not configured" });
+
+    // Get team agents
+    const [teamRows]: any = await db.execute(
+      "SELECT agent_name, role, personality, telegram_bot_token, bot_name, welcome_message FROM aba_team_agents WHERE user_id = ?",
+      [userId]
+    );
+
+    // Get business info
+    const [bizRows]: any = await db.execute("SELECT * FROM aba_businesses WHERE user_id = ?", [userId]);
+    const business = bizRows.length > 0 ? bizRows[0] : {};
+
+    const bizName = business.business_name || "My Business";
+
+    // Build multi-agent openclaw config (JSON)
+    const multiAgentConfig = {
+      admin_agent: {
+        name: admin.agent_name || "Assistant",
+        personality: admin.personality || "Professional",
+        telegram_token: admin.telegram_bot_token,
+        bot_name: admin.bot_name,
+      },
+      team_agents: teamRows.map((t: any) => ({
+        name: t.agent_name,
+        role: t.role,
+        personality: t.personality,
+        telegram_token: t.telegram_bot_token,
+        bot_name: t.bot_name,
+        welcome_message: t.welcome_message,
+      })),
+      business: { name: bizName },
+      generated_at: new Date().toISOString(),
+    };
+
+    // Write to a config file that the orchestrator reads
+    const configDir = path.join(__dirname, '..', 'configs', String(userId));
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(path.join(configDir, 'team-agents.json'), JSON.stringify(multiAgentConfig, null, 2));
+
+    res.json({
+      success: true,
+      message: `Applied ${teamRows.length} team agent(s).`,
+      agents: teamRows.length,
+    });
+  } catch (err: any) {
+    console.error("Apply team agents error:", err);
+    res.status(500).json({ error: "Failed to apply team agents" });
+  }
+});
