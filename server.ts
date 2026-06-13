@@ -1421,6 +1421,37 @@ app.get("/api/agent-sync", async (req, res) => {
         }
       } catch {}
 
+      // Include tool/integration config so live agents stay up to date
+      try {
+        const [cfgRows]: any = await db.execute(
+          "SELECT integrations, whatsapp_number, whatsapp_open_dm, " +
+          "email_pop_host, email_pop_user, " +
+          "twilio_sid, twilio_phone, " +
+          "github_token, " +
+          "woo_url, woo_key, woo_secret, " +
+          "shopify_url, shopify_access_token, " +
+          "db_connection_string, google_drive_folder " +
+          "FROM aba_agent_configs WHERE user_id = ?",
+          [userId]);
+        if (cfgRows.length > 0) {
+          const cfg = cfgRows[0];
+          // Parse integrations JSON
+          let integratedTools: string[] = [];
+          try { integratedTools = JSON.parse(cfg.integrations || "[]"); } catch {}
+          response.tool_config = {
+            integrations: integratedTools,
+            whatsapp: cfg.whatsapp_number ? { number: cfg.whatsapp_number, open_dm: !!cfg.whatsapp_open_dm } : null,
+            email: cfg.email_pop_host ? { host: cfg.email_pop_host, user: cfg.email_pop_user } : null,
+            twilio: cfg.twilio_sid ? { sid: cfg.twilio_sid.slice(0, 8) + "...", phone: cfg.twilio_phone } : null,
+            github: cfg.github_token ? { has_token: true } : null,
+            woo: cfg.woo_url ? { url: cfg.woo_url } : null,
+            shopify: cfg.shopify_url ? { url: cfg.shopify_url } : null,
+            database: cfg.db_connection_string ? { configured: true } : null,
+            google_drive: cfg.google_drive_folder ? { folder: cfg.google_drive_folder } : null,
+          };
+        }
+      } catch {}
+
       // Include products so agents stay up to date
       try {
         const [prodRows]: any = await db.execute("SELECT * FROM aba_products WHERE user_id = ?", [userId]);
