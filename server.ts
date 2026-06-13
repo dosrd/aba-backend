@@ -28,11 +28,19 @@ const DB_CONFIG = {
   database: process.env.DB_NAME || "aba_portal",
 };
 
-let db: mysql.Connection;
+let db: mysql.Pool;
 
 async function initDB() {
-  db = await mysql.createConnection(DB_CONFIG);
-  console.log("✅ MySQL connected to aba_portal");
+  db = mysql.createPool({
+    ...DB_CONFIG,
+    connectionLimit: 5,
+    waitForConnections: true,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 10000,
+  });
+  // Validate connection works
+  await db.query("SELECT 1");
+  console.log("✅ MySQL pool connected to aba_portal");
 
   // ===== Phase 1 Migration: Service keys table + new columns =====
   try {
@@ -384,17 +392,17 @@ app.get("/api/business", authMiddleware, async (req, res) => {
 app.put("/api/business", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const { business_name, description, industry, phone, website, address, logo_url } = req.body;
+    const { business_name, description, industry, registration_id, tax_id, phone, website, address, logo_url } = req.body;
     const [existing]: any = await db.execute("SELECT id FROM aba_businesses WHERE user_id = ?", [userId]);
     if (existing.length > 0) {
       await db.execute(
-        "UPDATE aba_businesses SET business_name=?, description=?, industry=?, phone=?, website=?, address=?, logo_url=? WHERE user_id=?",
-        [business_name, description, industry, phone, website, address, logo_url, userId]
+        "UPDATE aba_businesses SET business_name=?, description=?, industry=?, registration_id=?, tax_id=?, phone=?, website=?, address=?, logo_url=? WHERE user_id=?",
+        [business_name, description, industry, registration_id || '', tax_id || '', phone, website, address, logo_url, userId]
       );
     } else {
       await db.execute(
-        "INSERT INTO aba_businesses (user_id, business_name, description, industry, phone, website, address, logo_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        [userId, business_name, description, industry, phone, website, address, logo_url]
+        "INSERT INTO aba_businesses (user_id, business_name, description, industry, registration_id, tax_id, phone, website, address, logo_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [userId, business_name, description, industry, registration_id || '', tax_id || '', phone, website, address, logo_url]
       );
     }
     const [rows]: any = await db.execute("SELECT * FROM aba_businesses WHERE user_id = ?", [userId]);
@@ -456,7 +464,7 @@ app.get("/api/agent-config", authMiddleware, async (req, res) => {
 app.put("/api/agent-config", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const { agent_name, personality, telegram_bot_token, bot_name, welcome_message,
+    const { agent_name, gender, personality, telegram_bot_token, bot_name, welcome_message,
       whatsapp_number, whatsapp_open_dm, email_pop_host, email_pop_port, email_pop_user, email_pop_pass,
       twilio_sid, twilio_auth_token, twilio_phone, github_token, woo_url, woo_key, woo_secret,
       db_connection_string, google_drive_folder, knowledge_sources, integrations } = req.body;
@@ -464,15 +472,18 @@ app.put("/api/agent-config", authMiddleware, async (req, res) => {
     // mysql2 rejects `undefined` — coalesce any missing field to null
     const nz = (v: any) => (v === undefined ? null : v);
 
+    // Ping the DB pool to ensure connection is alive before deploying
+    try { await db.query("SELECT 1"); } catch { /* pool handles reconnect */ }
+
     const [existing]: any = await db.execute("SELECT id FROM aba_agent_configs WHERE user_id = ?", [userId]);
     if (existing.length > 0) {
       await db.execute(`UPDATE aba_agent_configs SET
-        agent_name=?, personality=?, telegram_bot_token=?, bot_name=?, welcome_message=?,
+        agent_name=?, gender=?, personality=?, telegram_bot_token=?, bot_name=?, welcome_message=?,
         whatsapp_number=?, whatsapp_open_dm=?, email_pop_host=?, email_pop_port=?, email_pop_user=?, email_pop_pass=?,
         twilio_sid=?, twilio_auth_token=?, twilio_phone=?, github_token=?, woo_url=?, woo_key=?, woo_secret=?,
         db_connection_string=?, google_drive_folder=?, knowledge_sources=?, integrations=?
         WHERE user_id=?`,
-        [nz(agent_name), nz(personality), nz(telegram_bot_token), bot_name || '', welcome_message || '',
+        [nz(agent_name), nz(gender), nz(personality), nz(telegram_bot_token), bot_name || '', welcome_message || '',
         nz(whatsapp_number), whatsapp_open_dm ?? 1, nz(email_pop_host), email_pop_port ?? 993, nz(email_pop_user), nz(email_pop_pass),
         nz(twilio_sid), nz(twilio_auth_token), nz(twilio_phone), nz(github_token), nz(woo_url), nz(woo_key), nz(woo_secret),
         nz(db_connection_string), nz(google_drive_folder), knowledge_sources ? JSON.stringify(knowledge_sources) : null,
@@ -480,12 +491,12 @@ app.put("/api/agent-config", authMiddleware, async (req, res) => {
       );
     } else {
       await db.execute(`INSERT INTO aba_agent_configs (
-        user_id, agent_name, personality, telegram_bot_token, bot_name, welcome_message,
+        user_id, agent_name, gender, personality, telegram_bot_token, bot_name, welcome_message,
         whatsapp_number, whatsapp_open_dm, email_pop_host, email_pop_port, email_pop_user, email_pop_pass,
         twilio_sid, twilio_auth_token, twilio_phone, github_token, woo_url, woo_key, woo_secret,
         db_connection_string, google_drive_folder, knowledge_sources, integrations
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [userId, nz(agent_name), nz(personality), nz(telegram_bot_token), bot_name || '', welcome_message || '',
+        [userId, nz(agent_name), nz(gender), nz(personality), nz(telegram_bot_token), bot_name || '', welcome_message || '',
         nz(whatsapp_number), whatsapp_open_dm ?? 1, nz(email_pop_host), email_pop_port ?? 993, nz(email_pop_user), nz(email_pop_pass),
         nz(twilio_sid), nz(twilio_auth_token), nz(twilio_phone), nz(github_token), nz(woo_url), nz(woo_key), nz(woo_secret),
         nz(db_connection_string), nz(google_drive_folder), knowledge_sources ? JSON.stringify(knowledge_sources) : null,
@@ -506,7 +517,7 @@ app.get("/api/team-agents", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
     const [rows]: any = await db.execute(
-      "SELECT id, agent_name, role, agent_slug, personality, telegram_bot_token, bot_name, welcome_message, status, telegram_bot_username, error_message, applied_at, created_at FROM aba_team_agents WHERE user_id = ? ORDER BY created_at ASC",
+      "SELECT id, agent_name, gender, role, agent_slug, personality, telegram_bot_token, bot_name, welcome_message, status, telegram_bot_username, error_message, applied_at, created_at FROM aba_team_agents WHERE user_id = ? ORDER BY created_at ASC",
       [userId]
     );
     // mask token in list response
@@ -521,15 +532,15 @@ app.get("/api/team-agents", authMiddleware, async (req, res) => {
 app.post("/api/team-agents", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const { agent_name, role, personality, telegram_bot_token, bot_name, welcome_message } = req.body;
+    const { agent_name, gender, role, personality, telegram_bot_token, bot_name, welcome_message } = req.body;
 
     if (!agent_name) return res.status(400).json({ error: "Agent name required" });
     if (!telegram_bot_token) return res.status(400).json({ error: "Telegram bot token required" });
 
     const result = await db.execute(
-      `INSERT INTO aba_team_agents (user_id, agent_name, role, personality, telegram_bot_token, bot_name, welcome_message)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [userId, agent_name, role || null, personality || 'Professional', telegram_bot_token, bot_name || '', welcome_message || '']
+      `INSERT INTO aba_team_agents (user_id, agent_name, gender, role, personality, telegram_bot_token, bot_name, welcome_message)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [userId, agent_name, gender || 'Female', role || null, personality || 'Professional', telegram_bot_token, bot_name || '', welcome_message || '']
     );
 
     res.json({ success: true, id: (result as any)[0]?.insertId });
