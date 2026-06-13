@@ -1420,6 +1420,12 @@ app.get("/api/agent-sync", async (req, res) => {
           response.owner_profile = { name: usrRows[0].name, email: usrRows[0].email };
         }
       } catch {}
+
+      // Include products so agents stay up to date
+      try {
+        const [prodRows]: any = await db.execute("SELECT * FROM aba_products WHERE user_id = ?", [userId]);
+        response.products = prodRows || [];
+      } catch {}
     }
 
     res.json(response);
