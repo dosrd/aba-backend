@@ -392,17 +392,17 @@ app.get("/api/business", authMiddleware, async (req, res) => {
 app.put("/api/business", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const { business_name, description, industry, registration_id, tax_id, phone, website, address, logo_url } = req.body;
+    const { business_name, description, industry, registration_id, tax_id, phone, website, address, logo_url, social_facebook, social_twitter, social_linkedin, social_instagram } = req.body;
     const [existing]: any = await db.execute("SELECT id FROM aba_businesses WHERE user_id = ?", [userId]);
     if (existing.length > 0) {
       await db.execute(
-        "UPDATE aba_businesses SET business_name=?, description=?, industry=?, registration_id=?, tax_id=?, phone=?, website=?, address=?, logo_url=? WHERE user_id=?",
-        [business_name, description, industry, registration_id || '', tax_id || '', phone, website, address, logo_url, userId]
+        "UPDATE aba_businesses SET business_name=?, description=?, industry=?, registration_id=?, tax_id=?, phone=?, website=?, address=?, logo_url=?, social_facebook=?, social_twitter=?, social_linkedin=?, social_instagram=? WHERE user_id=?",
+        [business_name, description, industry, registration_id || '', tax_id || '', phone, website, address, logo_url, social_facebook || '', social_twitter || '', social_linkedin || '', social_instagram || '', userId]
       );
     } else {
       await db.execute(
-        "INSERT INTO aba_businesses (user_id, business_name, description, industry, registration_id, tax_id, phone, website, address, logo_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [userId, business_name, description, industry, registration_id || '', tax_id || '', phone, website, address, logo_url]
+        "INSERT INTO aba_businesses (user_id, business_name, description, industry, registration_id, tax_id, phone, website, address, logo_url, social_facebook, social_twitter, social_linkedin, social_instagram) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [userId, business_name, description, industry, registration_id || '', tax_id || '', phone, website, address, logo_url, social_facebook || '', social_twitter || '', social_linkedin || '', social_instagram || '']
       );
     }
     const [rows]: any = await db.execute("SELECT * FROM aba_businesses WHERE user_id = ?", [userId]);
@@ -1405,6 +1405,21 @@ app.get("/api/agent-sync", async (req, res) => {
     }
     if (userId) {
       response.userFiles = files; // placeholder for per-user knowledge
+
+      // Include business details + user info so agents stay up to date
+      try {
+        const [bizRows]: any = await db.execute("SELECT * FROM aba_businesses WHERE user_id = ?", [userId]);
+        if (bizRows.length > 0) {
+          response.business = bizRows[0];
+        }
+      } catch {}
+
+      try {
+        const [usrRows]: any = await db.execute("SELECT name, email FROM aba_users WHERE id = ?", [userId]);
+        if (usrRows.length > 0) {
+          response.owner_profile = { name: usrRows[0].name, email: usrRows[0].email };
+        }
+      } catch {}
     }
 
     res.json(response);
