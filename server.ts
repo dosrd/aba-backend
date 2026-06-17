@@ -10,7 +10,7 @@ import path from "path";
 import fs from "fs";
 import dotenv from "dotenv";
 import cors from "cors";
-import { execSync, spawn as _spawnTeam } from "child_process";
+import { execSync, exec, spawn as _spawnTeam, spawn } from "child_process";
 import { fileURLToPath } from "url";
 dotenv.config();
 
@@ -144,17 +144,58 @@ app.post("/api/stripe-webhook", express.raw({ type: 'application/json' }), async
       case 'checkout.session.completed': {
         const session = event.data.object;
         const email = session.customer_details?.email || session.metadata?.email;
-        if (email) {
+        const isUpgrade = session.metadata?.is_upgrade === 'true';
+        let userId: number | null = null;
+
+        // For upgrades, we have user_id in metadata
+        if (isUpgrade && session.metadata?.user_id) {
+          userId = parseInt(session.metadata.user_id);
+        }
+
+        if (!userId && email) {
           const [rows]: any = await db.execute("SELECT id FROM aba_users WHERE email=?", [email]);
-          if (rows.length > 0) {
-            const userId = rows[0].id;
-            await db.execute(
-              "INSERT INTO aba_subscriptions (user_id, plan, status, stripe_subscription_id, current_period_start, current_period_end) VALUES (?, ?, 'active', ?, NOW(), DATE_ADD(NOW(), INTERVAL 1 MONTH))",
-              [userId, session.metadata?.plan || "entry", session.subscription || ""]
-            );
-            // Link Stripe customer
-            if (session.customer) {
-              await db.execute("UPDATE aba_users SET stripe_customer_id=? WHERE id=?", [session.customer, userId]);
+          if (rows.length > 0) userId = rows[0].id;
+        }
+
+        if (userId) {
+          // Insert new subscription record
+          await db.execute(
+            "INSERT INTO aba_subscriptions (user_id, plan, status, stripe_subscription_id, current_period_start, current_period_end) VALUES (?, ?, 'active', ?, NOW(), DATE_ADD(NOW(), INTERVAL 1 MONTH))",
+            [userId, session.metadata?.plan || "entry", session.subscription || ""]
+          );
+          // Link Stripe customer
+          if (session.customer) {
+            await db.execute("UPDATE aba_users SET stripe_customer_id=? WHERE id=?", [session.customer, userId]);
+          }
+
+          // If upgrade: decommission old spot instance + re-queue deployment
+          if (isUpgrade) {
+            console.log(`Upgrade detected for user ${userId} — beginning migration...`);
+            try {
+              // 1. Find and terminate old EC2 spot instance
+              const [depRows]: any = await db.execute(
+                "SELECT id, instance_id FROM aba_deployments WHERE user_id=? AND status IN ('active','provisioning','failed')", [userId]
+              );
+              if (depRows.length > 0) {
+                const dep = depRows[0];
+                if (dep.instance_id) {
+                  try {
+                    execSync(`aws ec2 terminate-instances --instance-ids ${dep.instance_id} --region us-east-1`, { timeout: 15000, stdio: 'pipe' });
+                    console.log(`Terminated old spot instance ${dep.instance_id} for user ${userId}`);
+                  } catch (e: any) {
+                    console.error(`Failed to terminate instance ${dep.instance_id}:`, e.message);
+                  }
+                }
+                // 2. Re-queue deployment as pending (orchestrator will pick up with on-demand)
+                const bindCode = require('crypto').randomBytes(4).toString('hex');
+                await db.execute(
+                  "UPDATE aba_deployments SET status='pending', instance_id=NULL, public_ip=NULL, admin_token=NULL, error_message=NULL, deploy_id=NULL, telegram_bot_username=NULL, last_health_check=NULL, deployed_at=NULL, bind_code=? WHERE id=?",
+                  [bindCode, dep.id]
+                );
+                console.log(`Re-queued deployment #${dep.id} for user ${userId} — orchestrator will provision on-demand`);
+              }
+            } catch (migrateErr: any) {
+              console.error("Migration error:", migrateErr.message);
             }
           }
         }
@@ -214,9 +255,10 @@ app.post("/api/auth/register", async (req, res) => {
     );
     const userId = result[0].insertId;
     await db.execute(
-      "INSERT INTO aba_subscriptions (user_id, plan, status) VALUES (?, 'entry', 'inactive')",
+      "INSERT INTO aba_subscriptions (user_id, plan, status) VALUES (?, 'trial', 'active')",
       [userId]
     );
+    // Set 14-day trial expiry in user metadata or a separate expiry field
     await db.execute(
       "INSERT INTO aba_agent_configs (user_id, agent_name, personality) VALUES (?, 'My Assistant', 'Professional')",
       [userId]
@@ -261,7 +303,7 @@ app.post("/api/auth/google", async (req, res) => {
       const [nr]: any = await db.execute("SELECT id, email, name FROM aba_users WHERE email = ?", [email]);
       rows = nr;
       const userId = rows[0].id;
-      await db.execute("INSERT INTO aba_subscriptions (user_id, plan, status) VALUES (?, 'entry', 'inactive')", [userId]);
+      await db.execute("INSERT INTO aba_subscriptions (user_id, plan, status) VALUES (?, 'trial', 'active')", [userId]);
       await db.execute("INSERT INTO aba_agent_configs (user_id, agent_name, personality) VALUES (?, 'My Assistant', 'Professional')", [userId]);
     } else {
       await db.execute("UPDATE aba_users SET google_id = ? WHERE email = ?", [googleId, email]);
@@ -464,10 +506,11 @@ app.get("/api/agent-config", authMiddleware, async (req, res) => {
 app.put("/api/agent-config", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const { agent_name, gender, personality, telegram_bot_token, bot_name, welcome_message,
+    const { agent_name, gender, role, personality, telegram_bot_token, bot_name, welcome_message,
       whatsapp_number, whatsapp_open_dm, email_pop_host, email_pop_port, email_pop_user, email_pop_pass,
       twilio_sid, twilio_auth_token, twilio_phone, github_token, woo_url, woo_key, woo_secret,
-      db_connection_string, google_drive_folder, knowledge_sources, integrations } = req.body;
+      db_connection_string, google_drive_folder, knowledge_sources, integrations,
+      timezone, nationality_vibe } = req.body;
 
     // mysql2 rejects `undefined` — coalesce any missing field to null
     const nz = (v: any) => (v === undefined ? null : v);
@@ -478,16 +521,17 @@ app.put("/api/agent-config", authMiddleware, async (req, res) => {
     const [existing]: any = await db.execute("SELECT id FROM aba_agent_configs WHERE user_id = ?", [userId]);
     if (existing.length > 0) {
       await db.execute(`UPDATE aba_agent_configs SET
-        agent_name=?, gender=?, personality=?, telegram_bot_token=?, bot_name=?, welcome_message=?,
+        agent_name=?, gender=?, role=?, personality=?, telegram_bot_token=?, bot_name=?, welcome_message=?,
         whatsapp_number=?, whatsapp_open_dm=?, email_pop_host=?, email_pop_port=?, email_pop_user=?, email_pop_pass=?,
         twilio_sid=?, twilio_auth_token=?, twilio_phone=?, github_token=?, woo_url=?, woo_key=?, woo_secret=?,
-        db_connection_string=?, google_drive_folder=?, knowledge_sources=?, integrations=?
+        db_connection_string=?, google_drive_folder=?, knowledge_sources=?, integrations=?,
+        timezone=?, nationality_vibe=?
         WHERE user_id=?`,
-        [nz(agent_name), nz(gender), nz(personality), nz(telegram_bot_token), bot_name || '', welcome_message || '',
+        [nz(agent_name), nz(gender), nz(role) || 'General Assistant', nz(personality), nz(telegram_bot_token), bot_name || '', welcome_message || '',
         nz(whatsapp_number), whatsapp_open_dm ?? 1, nz(email_pop_host), email_pop_port ?? 993, nz(email_pop_user), nz(email_pop_pass),
         nz(twilio_sid), nz(twilio_auth_token), nz(twilio_phone), nz(github_token), nz(woo_url), nz(woo_key), nz(woo_secret),
         nz(db_connection_string), nz(google_drive_folder), knowledge_sources ? JSON.stringify(knowledge_sources) : null,
-        integrations ? JSON.stringify(integrations) : null, userId]
+        integrations ? JSON.stringify(integrations) : null, timezone || null, nationality_vibe || null, userId]
       );
     } else {
       await db.execute(`INSERT INTO aba_agent_configs (
@@ -504,6 +548,17 @@ app.put("/api/agent-config", authMiddleware, async (req, res) => {
       );
     }
     const [rows]: any = await db.execute("SELECT * FROM aba_agent_configs WHERE user_id = ?", [userId]);
+
+    // Fire-and-forget: push profile updates to the live EC2 agent
+    if (rows.length > 0) {
+      const adminApplyScript = "/root/.openclaw/workspace/scripts/aba-admin-apply.py";
+      const child = spawn("python3", [adminApplyScript, String(userId), "--soul-only"], {
+        detached: true,
+        stdio: "ignore",
+      });
+      child.unref();
+    }
+
     res.json(rows[0]);
   } catch (err: any) {
     console.error("Update agent config error:", err);
@@ -517,7 +572,7 @@ app.get("/api/team-agents", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
     const [rows]: any = await db.execute(
-      "SELECT id, agent_name, gender, role, agent_slug, personality, telegram_bot_token, bot_name, welcome_message, status, telegram_bot_username, error_message, applied_at, created_at FROM aba_team_agents WHERE user_id = ? ORDER BY created_at ASC",
+      "SELECT id, agent_name, gender, role, agent_slug, personality, telegram_bot_token, bot_name, welcome_message, status, telegram_bot_username, whatsapp_number, wa_paired, error_message, applied_at, created_at, custom_instructions FROM aba_team_agents WHERE user_id = ? ORDER BY created_at ASC",
       [userId]
     );
     // mask token in list response
@@ -532,21 +587,38 @@ app.get("/api/team-agents", authMiddleware, async (req, res) => {
 app.post("/api/team-agents", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const { agent_name, gender, role, personality, telegram_bot_token, bot_name, welcome_message } = req.body;
+    const { agent_name, gender, role, personality, telegram_bot_token, bot_name, welcome_message, whatsapp_number, custom_instructions, agent_slug } = req.body;
 
     if (!agent_name) return res.status(400).json({ error: "Agent name required" });
-    if (!telegram_bot_token) return res.status(400).json({ error: "Telegram bot token required" });
+    // Channels are linked post-creation from the Manage page — not required at creation time
 
     const result = await db.execute(
-      `INSERT INTO aba_team_agents (user_id, agent_name, gender, role, personality, telegram_bot_token, bot_name, welcome_message)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [userId, agent_name, gender || 'Female', role || null, personality || 'Professional', telegram_bot_token, bot_name || '', welcome_message || '']
+      `INSERT INTO aba_team_agents (user_id, agent_name, gender, role, agent_slug, personality, telegram_bot_token, bot_name, welcome_message, whatsapp_number, custom_instructions)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [userId, agent_name, gender || 'Female', role || null, agent_slug || null, personality || 'Professional', telegram_bot_token || null, bot_name || '', welcome_message || '', whatsapp_number || null, custom_instructions || null]
     );
 
     res.json({ success: true, id: (result as any)[0]?.insertId });
   } catch (err: any) {
     console.error("Create team agent error:", err);
     res.status(500).json({ error: "Failed to create team agent" });
+  }
+});
+
+// Update a team agent
+app.put("/api/team-agents/:id", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const { agent_name, gender, role, personality, telegram_bot_token, bot_name, welcome_message, whatsapp_number, custom_instructions, agent_slug } = req.body;
+    const result = await db.execute(
+      `UPDATE aba_team_agents SET agent_name=?, gender=?, role=?, agent_slug=?, personality=?, telegram_bot_token=?, bot_name=?, welcome_message=?, whatsapp_number=?, custom_instructions=? WHERE id=? AND user_id=?`,
+      [agent_name, gender || 'Female', role || null, agent_slug || null, personality || 'Professional', telegram_bot_token || null, bot_name || '', welcome_message || '', whatsapp_number || null, custom_instructions || null, req.params.id, userId]
+    );
+    if ((result as any)[0]?.affectedRows === 0) return res.status(404).json({ error: "Team agent not found" });
+    res.json({ success: true });
+  } catch (err: any) {
+    console.error("Update team agent error:", err);
+    res.status(500).json({ error: "Failed to update team agent" });
   }
 });
 
@@ -579,8 +651,8 @@ app.post("/api/team-agents/launch", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "No team agents to launch." });
     }
 
-    // Mark applying immediately so the UI can poll
-    await db.execute("UPDATE aba_team_agents SET status='applying', error_message=NULL WHERE user_id = ?", [userId]);
+    // Mark applying (only non-active agents)
+    await db.execute("UPDATE aba_team_agents SET status='applying', error_message=NULL WHERE user_id = ? AND (status IS NULL OR status='draft' OR status='failed')", [userId]);
 
     // Fire-and-forget the apply script (it updates DB status when done)
     const child = _spawnTeam("python3", [TEAM_APPLY_SCRIPT, String(userId)], {
@@ -598,25 +670,90 @@ app.post("/api/team-agents/launch", authMiddleware, async (req, res) => {
 
 // ==================== AGENT TEMPLATES ====================
 
-app.get("/api/agent-templates", async (req, res) => {
+app.get("/api/agent-templates", authMiddleware, async (req, res) => {
   try {
-    const [rows]: any = await db.execute("SELECT * FROM aba_agent_templates ORDER BY id");
-    rows.forEach((r: any) => { if (typeof r.traits === "string") r.traits = JSON.parse(r.traits || "{}"); });
+    const { userId } = (req as any).user;
+    const [userRows]: any = await db.execute("SELECT selected_template FROM aba_users WHERE id = ?", [userId]);
+    const activeSlug = userRows[0]?.selected_template || null;
+    // Only return team-agent templates (is_system_admin=0), not the hidden system admin template
+    const [rows]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE (is_global=1 OR user_id=?) AND is_system_admin=0 ORDER BY is_global DESC, id ASC", [userId]);
+    rows.forEach((r: any) => {
+      if (typeof r.traits === "string") r.traits = JSON.parse(r.traits || "{}");
+      r.is_active = r.slug === activeSlug ? 1 : 0;
+    });
     res.json(rows);
   } catch { res.status(500).json({ error: "Failed to fetch templates" }); }
 });
 
-app.post("/api/agent-config/apply-template/:templateId", authMiddleware, async (req, res) => {
+app.post("/api/agent-templates/clone/:templateId", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
     const [templates]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE id = ?", [req.params.templateId]);
     if (templates.length === 0) return res.status(404).json({ error: "Template not found" });
-    const tmpl = templates[0];
-    await db.execute("UPDATE aba_agent_configs SET agent_name=?, personality=?, welcome_message=? WHERE user_id=?", [tmpl.name, tmpl.personality, tmpl.welcome_message || "", userId]);
-    await db.execute("UPDATE aba_users SET selected_template=? WHERE id=?", [tmpl.slug, userId]);
-    const [configs]: any = await db.execute("SELECT * FROM aba_agent_configs WHERE user_id=?", [userId]);
-    res.json({ success: true, config: configs[0], template: tmpl });
-  } catch { res.status(500).json({ error: "Failed to apply template" }); }
+    const src = templates[0];
+    // Create a user-owned copy with a unique slug
+    const slug = (src.name + '-' + userId + '-' + Date.now()).toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    const [result]: any = await db.execute(
+      "INSERT INTO aba_agent_templates (name, slug, gender, personality, role, description, instructions, welcome_message, is_global, user_id, avatar_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+      [src.name + ' (clone)', slug, src.gender, src.personality, src.role, src.description, src.instructions, src.welcome_message || null, userId, src.avatar_url || null]
+    );
+    const [rows]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE id = ?", [result.insertId]);
+    if (rows[0]?.traits && typeof rows[0].traits === "string") rows[0].traits = JSON.parse(rows[0].traits || "{}");
+    res.json(rows[0]);
+  } catch { res.status(500).json({ error: "Failed to clone template" }); }
+});
+
+app.post("/api/agent-templates", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const { name, gender, personality, role, description, instructions, welcome_message } = req.body;
+    if (!name) return res.status(400).json({ error: "Name is required" });
+    const slug = name.toLowerCase().replace(/[^a-z0-9]/g, '-') + '-' + Date.now();
+    const [result]: any = await db.execute(
+      "INSERT INTO aba_agent_templates (name, slug, gender, personality, role, description, instructions, welcome_message, is_global, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+      [name, slug, gender || 'neutral', personality || 'Friendly', role || 'General Assistant', description || null, instructions || null, welcome_message || null, userId]
+    );
+    const [rows]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE id = ?", [result.insertId]);
+    if (rows[0]?.traits && typeof rows[0].traits === "string") rows[0].traits = JSON.parse(rows[0].traits || "{}");
+    res.json(rows[0]);
+  } catch { res.status(500).json({ error: "Failed to create template" }); }
+});
+
+app.put("/api/agent-templates/:id", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const { name, gender, personality, role, description, instructions, welcome_message } = req.body;
+    const [existing]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE id = ?", [req.params.id]);
+    if (!existing.length) return res.status(404).json({ error: "Template not found" });
+    const t = existing[0];
+    // Only allow editing own custom templates, not system global ones
+    if (parseInt(t.is_global)) {
+      return res.status(403).json({ error: "Cannot edit system templates" });
+    }
+    if (parseInt(t.user_id) !== parseInt(userId)) {
+      return res.status(403).json({ error: "Not your template" });
+    }
+    await db.execute(
+      "UPDATE aba_agent_templates SET name=?, gender=?, personality=?, role=?, description=?, instructions=?, welcome_message=? WHERE id=?",
+      [name || t.name, gender || t.gender, personality || t.personality, role || t.role, description !== undefined ? description : t.description, instructions !== undefined ? instructions : t.instructions, welcome_message !== undefined ? welcome_message : t.welcome_message, req.params.id]
+    );
+    const [rows]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE id = ?", [req.params.id]);
+    if (rows[0]?.traits && typeof rows[0].traits === "string") rows[0].traits = JSON.parse(rows[0].traits || "{}");
+    res.json(rows[0]);
+  } catch { res.status(500).json({ error: "Failed to update template" }); }
+});
+
+app.delete("/api/agent-templates/:id", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const [existing]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE id = ?", [req.params.id]);
+    if (!existing.length) return res.status(404).json({ error: "Template not found" });
+    const t = existing[0];
+    if (parseInt(t.is_global)) return res.status(403).json({ error: "Cannot delete system templates" });
+    if (parseInt(t.user_id) !== parseInt(userId)) return res.status(403).json({ error: "Not your template" });
+    await db.execute("DELETE FROM aba_agent_templates WHERE id = ?", [req.params.id]);
+    res.json({ success: true });
+  } catch { res.status(500).json({ error: "Failed to delete template" }); }
 });
 
 // ==================== API KEYS ====================
@@ -744,6 +881,39 @@ app.get("/api/subscription", authMiddleware, async (req, res) => {
   } catch { res.status(500).json({ error: "Failed to fetch subscription" }); }
 });
 
+app.post("/api/subscription/activate-trial", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    // Check if trial already active or has been used
+    const [existing]: any = await db.execute(
+      "SELECT id, plan, status FROM aba_subscriptions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1", [userId]
+    );
+    if (existing.length > 0 && existing[0].status === 'active') {
+      // Already has an active sub (could be trial or paid)
+      res.json({ subscription: existing[0] });
+      return;
+    }
+    // Check if they already used a trial
+    const [usedTrial]: any = await db.execute(
+      "SELECT COUNT(*) as cnt FROM aba_subscriptions WHERE user_id = ? AND plan = 'trial'", [userId]
+    );
+    if (usedTrial[0].cnt > 0) {
+      res.status(400).json({ error: "You've already used your free trial. Please choose a paid plan." });
+      return;
+    }
+    await db.execute(
+      "INSERT INTO aba_subscriptions (user_id, plan, status) VALUES (?, 'trial', 'active')", [userId]
+    );
+    const [sub]: any = await db.execute(
+      "SELECT plan, status FROM aba_subscriptions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1", [userId]
+    );
+    res.json({ subscription: sub[0] });
+  } catch (err: any) {
+    console.error("Activate trial error:", err);
+    res.status(500).json({ error: "Failed to activate trial" });
+  }
+});
+
 app.post("/api/subscription/cancel", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
@@ -815,7 +985,6 @@ app.post("/api/deploy", authMiddleware, async (req, res) => {
 
     const [agentRows]: any = await db.execute("SELECT * FROM aba_agent_configs WHERE user_id=?", [userId]);
     const agent = agentRows.length > 0 ? agentRows[0] : null;
-    if (!agent || !agent.telegram_bot_token) return res.status(400).json({ error: "Telegram bot token required" });
 
     const [userRows]: any = await db.execute("SELECT * FROM aba_users WHERE id=?", [userId]);
     const user = userRows[0];
@@ -980,11 +1149,47 @@ app.post("/api/create-checkout-session", async (req, res) => {
       success_url: `${req.headers.origin}/#/dashboard/setup?from=quickstart&success=true`,
       cancel_url: `${req.headers.origin}/pricing?canceled=true`,
       ...(userEmail ? { customer_email: userEmail } : {}),
-      metadata: { plan: planName, email: userEmail || '' },
+      metadata: { plan: planName, email: userEmail || '', is_upgrade: 'false' },
     });
     res.json({ url: session.url });
   } catch (error: any) {
     console.error("Stripe Error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== UPGRADE SUBSCRIPTION (auth-only, existing users) ====================
+app.post("/api/subscription/upgrade", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const { planName, price, interval } = req.body;
+    if (!planName || !price) return res.status(400).json({ error: "planName and price required" });
+
+    const [userRows]: any = await db.execute("SELECT email, name FROM aba_users WHERE id=?", [userId]);
+    if (userRows.length === 0) return res.status(404).json({ error: "User not found" });
+    const userEmail = userRows[0].email;
+
+    const stripe = getStripe();
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      line_items: [{
+        price_data: {
+          currency: "usd",
+          product_data: { name: `ABA ${planName} Plan`, description: `Autonomous Business Agents - ${planName} Subscription` },
+          unit_amount: Math.round(parseFloat(price) * 100),
+          recurring: { interval: interval || "month" },
+        },
+        quantity: 1,
+      }],
+      mode: "subscription",
+      success_url: `${req.headers.origin}/#/dashboard/subscription?upgrade=true`,
+      cancel_url: `${req.headers.origin}/#/dashboard/subscription`,
+      customer_email: userEmail,
+      metadata: { plan: planName, email: userEmail, user_id: String(userId), is_upgrade: 'true' },
+    });
+    res.json({ url: session.url });
+  } catch (error: any) {
+    console.error("Upgrade error:", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -1478,6 +1683,498 @@ app.get("/api/agent-sync", async (req, res) => {
     res.json(response);
   } catch { res.status(500).json({ error: "Sync failed" }); }
 });
+
+// ==================== VERIFY TELEGRAM BOT TOKEN ====================
+app.post("/api/verify-telegram-token", async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ valid: false, error: "Token required" });
+
+    const resp = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+    const data: any = await resp.json();
+
+    if (data.ok) {
+      res.json({ valid: true, username: data.result.username, id: data.result.id, first_name: data.result.first_name });
+    } else {
+      res.json({ valid: false, error: data.description || "Invalid token" });
+    }
+  } catch (err: any) {
+    res.status(500).json({ valid: false, error: err.message });
+  }
+});
+
+// Connect the ADMIN agent's Telegram bot to the live EC2 OpenClaw instance.
+// Verifies the token, saves it, then SSH-merges it into openclaw.json and restarts.
+const ADMIN_TG_APPLY_SCRIPT = "/root/.openclaw/workspace/scripts/aba-admin-telegram-apply.py";
+
+app.post("/api/agent-config/connect-telegram", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const { token, bot_name } = req.body;
+    if (!token) return res.status(400).json({ success: false, error: "Token required" });
+
+    // 1. Verify token with Telegram
+    const resp = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+    const data: any = await resp.json();
+    if (!data.ok) {
+      return res.status(400).json({ success: false, error: data.description || "Invalid token" });
+    }
+    const username = data.result.username;
+
+    // 2. Persist token + bot_name on the admin config
+    const [existing]: any = await db.execute("SELECT id FROM aba_agent_configs WHERE user_id = ?", [userId]);
+    if (existing.length > 0) {
+      await db.execute("UPDATE aba_agent_configs SET telegram_bot_token=?, bot_name=?, telegram_bot_username=? WHERE user_id=?", [token, bot_name || '', username, userId]);
+    } else {
+      await db.execute("INSERT INTO aba_agent_configs (user_id, telegram_bot_token, bot_name, telegram_bot_username) VALUES (?, ?, ?, ?)", [userId, token, bot_name || '', username]);
+    }
+
+    // 3. Check deployment status
+    const [depRows]: any = await db.execute("SELECT status, public_ip FROM aba_deployments WHERE user_id = ?", [userId]);
+    const dep = depRows.length > 0 ? depRows[0] : null;
+    if (!dep || dep.status !== 'active' || !dep.public_ip) {
+      // Token saved, but no live server to apply to yet — it'll be picked up on next deploy.
+      return res.json({ success: true, username, applied: false, message: "Token saved. Your bot will connect once your agent server is live." });
+    }
+
+    // 4. Apply to the live EC2 (await so the wizard gets a real result)
+    await new Promise<void>((resolve, reject) => {
+      let stderr = "";
+      const child = spawn("python3", [ADMIN_TG_APPLY_SCRIPT, String(userId)], { stdio: ["ignore", "ignore", "pipe"] });
+      child.stderr.on("data", (d) => { stderr += d.toString(); });
+      child.on("close", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(stderr.trim() || `apply exited ${code}`));
+      });
+      child.on("error", reject);
+      // hard timeout so the request never hangs forever
+      setTimeout(() => { try { child.kill("SIGKILL"); } catch {} reject(new Error("Apply timed out — your server may be slow to restart. Check back shortly.")); }, 90000);
+    });
+
+    res.json({ success: true, username, applied: true, message: `@${username} connected and live on your server.` });
+  } catch (err: any) {
+    console.error("Admin Telegram connect error:", err);
+    res.status(500).json({ success: false, error: err.message || "Failed to connect Telegram bot" });
+  }
+});
+
+// ==================== WHATSAPP PAIRING (via EC2 Agent HTTP API) ====================
+// The EC2 runs a tiny agent-server on port 4321 that handles pairing directly.
+// No SSH, no execSync, no bash spawns.
+
+interface AgentApiStatus {
+  stage: string;
+  qr_data_url?: string | null;
+  error?: string;
+  creds_saved?: boolean;
+  ts?: number;
+}
+
+async function agentApi(ip: string, method: string, path: string, body?: any): Promise<any> {
+  const TOKEN = process.env.AGENT_TOKEN || 'aba-agent-4321-secure-key';
+  const url = `http://${ip}:4321${path}`;
+  const res = await fetch(url, {
+    method,
+    headers: {
+      'x-agent-token': TOKEN,
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => 'Agent API error');
+    throw new Error(`Agent API ${method} ${path}: ${res.status} ${errText.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+// The gen-wa-qr-v4.js script content (embedded — no SCP needed)
+let whatsappPairScript: string | null = null;
+
+function getWhatsAppPairScript(): string {
+  if (whatsappPairScript) return whatsappPairScript;
+  whatsappPairScript = fs.readFileSync(path.join(__dirname, 'gen-wa-qr-v4.js'), 'utf-8');
+  return whatsappPairScript!;
+}
+
+// Initiate WhatsApp pairing on the user's EC2 instance
+app.post("/api/whatsapp/pair", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const [depRows]: any = await db.execute(
+      "SELECT public_ip FROM aba_deployments WHERE user_id=? AND status='active'", [userId]
+    );
+    if (!depRows.length || !depRows[0].public_ip) {
+      return res.status(400).json({ error: "No active EC2 deployment found" });
+    }
+    const ip = depRows[0].public_ip;
+
+    // Call the agent-server HTTP API (fire-and-forget, non-blocking)
+    const scriptContent = getWhatsAppPairScript();
+    const result = await agentApi(ip, 'POST', '/whatsapp/pair', { script_content: scriptContent });
+
+    res.json(result);
+  } catch (err: any) {
+    console.error("WhatsApp pair error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// WhatsApp reconnection (clears old creds + activation, starts fresh pairing)
+app.post("/api/whatsapp/reconnect", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const [depRows]: any = await db.execute(
+      "SELECT public_ip FROM aba_deployments WHERE user_id=? AND status='active'", [userId]
+    );
+    if (!depRows.length || !depRows[0].public_ip) {
+      return res.status(400).json({ error: "No active EC2 deployment found" });
+    }
+    const ip = depRows[0].public_ip;
+
+    const scriptContent = getWhatsAppPairScript();
+    const result = await agentApi(ip, 'POST', '/whatsapp/reconnect', { script_content: scriptContent });
+
+    res.json(result);
+  } catch (err: any) {
+    console.error("WhatsApp reconnect error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Poll WhatsApp pairing status
+app.get("/api/whatsapp/pair-status", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const [depRows]: any = await db.execute(
+      "SELECT public_ip FROM aba_deployments WHERE user_id=? AND status='active'", [userId]
+    );
+    if (!depRows.length || !depRows[0].public_ip) {
+      return res.json({ status: 'no_deployment' });
+    }
+    const ip = depRows[0].public_ip;
+
+    const status = await agentApi(ip, 'GET', '/whatsapp/pair-status');
+
+    // Auto-activate: when pairing completes, wire WhatsApp into OpenClaw config
+    if (status.stage === 'connected') {
+      // Fire-and-forget — user's frontend already shows connected
+      agentApi(ip, 'POST', '/whatsapp/activate', {}).catch(err => {
+        console.log('WA auto-activate (non-fatal):', err.message);
+      });
+    }
+
+    res.json(status);
+  } catch (err: any) {
+    // If agent is unreachable, return initializing (poll will retry)
+    res.json({ stage: 'initializing' });
+  }
+});
+
+// Check if WhatsApp is already paired
+app.get("/api/whatsapp/status", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const [depRows]: any = await db.execute(
+      "SELECT public_ip FROM aba_deployments WHERE user_id=? AND status='active'", [userId]
+    );
+    if (!depRows.length || !depRows[0].public_ip) {
+      return res.json({ paired: false });
+    }
+    const ip = depRows[0].public_ip;
+
+    const status = await agentApi(ip, 'GET', '/whatsapp/status');
+    res.json(status);
+  } catch (err: any) {
+    res.json({ paired: false });
+  }
+});
+
+// ───── Team Agent WhatsApp Pairing ─────
+// Per-agent WhatsApp linking: enters creds into the team agent's record
+app.post("/api/team-agents/:id/whatsapp/pair", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const agentId = parseInt(req.params.id, 10);
+
+    // Verify team agent belongs to this user
+    const [taRows]: any = await db.execute(
+      "SELECT id FROM aba_team_agents WHERE id=? AND user_id=?", [agentId, userId]
+    );
+    if (!taRows.length) return res.status(404).json({ error: "Team agent not found" });
+
+    // Get the user's EC2
+    const [depRows]: any = await db.execute(
+      "SELECT public_ip FROM aba_deployments WHERE user_id=? AND status='active'", [userId]
+    );
+    if (!depRows.length || !depRows[0].public_ip) {
+      return res.status(400).json({ error: "No active EC2 deployment found" });
+    }
+    const ip = depRows[0].public_ip;
+
+    // Send the team pairing script to the agent-server
+    const teamScriptContent = fs.readFileSync(path.join(__dirname, 'gen-wa-qr-v4-team.js'), 'utf-8');
+    const result = await agentApi(ip, 'POST', '/whatsapp/pair-team/' + agentId, {
+      script_content: teamScriptContent
+    });
+
+    res.json(result);
+  } catch (err: any) {
+    console.error("Team agent WA pair error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Poll per-team-agent WhatsApp pairing status
+app.get("/api/team-agents/:id/whatsapp/pair-status", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const agentId = parseInt(req.params.id, 10);
+
+    const [depRows]: any = await db.execute(
+      "SELECT public_ip FROM aba_deployments WHERE user_id=? AND status='active'", [userId]
+    );
+    if (!depRows.length || !depRows[0].public_ip) {
+      return res.json({ status: 'no_deployment' });
+    }
+    const ip = depRows[0].public_ip;
+
+    const status = await agentApi(ip, 'GET', '/whatsapp/pair-team-status/' + agentId);
+
+    // When team agent pairs, update DB
+    if (status.stage === 'connected') {
+      await db.execute(
+        "UPDATE aba_team_agents SET wa_paired=1, status='active' WHERE id=? AND user_id=?", [agentId, userId]
+      );
+    }
+
+    res.json(status);
+  } catch (err: any) {
+    res.json({ stage: 'initializing', agent_id: parseInt(req.params.id, 10) });
+  }
+});
+
+// ==================== PER-TEAM-AGENT CHANNEL MANAGEMENT ====================
+
+// ─═══ WhatsApp ─═══
+
+// Activate WhatsApp for a team agent
+app.post("/api/team-agents/:id/whatsapp/activate", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const agentId = parseInt(req.params.id, 10);
+
+    // Verify team agent belongs to this user
+    const [taRows]: any = await db.execute(
+      "SELECT id, agent_name, agent_slug, role, personality FROM aba_team_agents WHERE id=? AND user_id=?", [agentId, userId]
+    );
+    if (!taRows.length) return res.status(404).json({ error: "Team agent not found" });
+    const ta = taRows[0];
+
+    const [depRows]: any = await db.execute(
+      "SELECT public_ip FROM aba_deployments WHERE user_id=? AND status='active'", [userId]
+    );
+    if (!depRows.length || !depRows[0].public_ip) {
+      return res.status(400).json({ error: "No active EC2 deployment found" });
+    }
+    const ip = depRows[0].public_ip;
+
+    const result = await agentApi(ip, 'POST', '/whatsapp/activate-team/' + agentId, {
+      agent_slug: ta.agent_slug || 'team-' + agentId,
+      agent_name: ta.agent_name,
+      agent_role: ta.role,
+      agent_personality: ta.personality
+    });
+
+    res.json(result);
+  } catch (err: any) {
+    console.error("Team agent WA activate error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Check activation status for a team agent's WhatsApp
+app.get("/api/team-agents/:id/whatsapp/activate-status", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const agentId = parseInt(req.params.id, 10);
+
+    const [depRows]: any = await db.execute(
+      "SELECT public_ip FROM aba_deployments WHERE user_id=? AND status='active'", [userId]
+    );
+    if (!depRows.length || !depRows[0].public_ip) {
+      return res.json({ activated: false });
+    }
+    const ip = depRows[0].public_ip;
+
+    const status = await agentApi(ip, 'GET', '/whatsapp/activate-team-status/' + agentId);
+    res.json(status);
+  } catch {
+    res.json({ activated: false });
+  }
+});
+
+// Disconnect WhatsApp for a team agent
+app.post("/api/team-agents/:id/whatsapp/disconnect", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const agentId = parseInt(req.params.id, 10);
+
+    const [depRows]: any = await db.execute(
+      "SELECT public_ip FROM aba_deployments WHERE user_id=? AND status='active'", [userId]
+    );
+    if (!depRows.length || !depRows[0].public_ip) {
+      return res.status(400).json({ error: "No active EC2 deployment found" });
+    }
+    const ip = depRows[0].public_ip;
+
+    const [taRows]: any = await db.execute(
+      "SELECT agent_slug FROM aba_team_agents WHERE id=? AND user_id=?", [agentId, userId]
+    );
+    const agentSlug = taRows.length ? (taRows[0].agent_slug || 'team-' + agentId) : 'team-' + agentId;
+
+    await agentApi(ip, 'POST', '/whatsapp/disconnect-team/' + agentId, { agent_slug: agentSlug });
+
+    // Update DB
+    await db.execute(
+      "UPDATE aba_team_agents SET wa_paired=0 WHERE id=? AND user_id=?", [agentId, userId]
+    );
+
+    res.json({ success: true, message: 'WhatsApp disconnected' });
+  } catch (err: any) {
+    console.error("Team agent WA disconnect error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─═══ Telegram ─═══
+
+// Configure Telegram for a team agent (post-deploy)
+app.post("/api/team-agents/:id/telegram/connect", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const agentId = parseInt(req.params.id, 10);
+    const { bot_token } = req.body;
+    if (!bot_token) return res.status(400).json({ error: "bot_token required" });
+
+    // Validate token
+    const valResp = await fetch(`https://api.telegram.org/bot${bot_token}/getMe`);
+    const valData: any = await valResp.json();
+    if (!valData.ok) return res.status(400).json({ error: "Invalid Telegram bot token" });
+    const botUsername = valData.result.username;
+
+    // Verify team agent belongs to this user
+    const [taRows]: any = await db.execute(
+      "SELECT id, agent_slug, agent_name, role, personality FROM aba_team_agents WHERE id=? AND user_id=?", [agentId, userId]
+    );
+    if (!taRows.length) return res.status(404).json({ error: "Team agent not found" });
+    const ta = taRows[0];
+
+    const [depRows]: any = await db.execute(
+      "SELECT public_ip FROM aba_deployments WHERE user_id=? AND status='active'", [userId]
+    );
+    if (!depRows.length || !depRows[0].public_ip) {
+      return res.status(400).json({ error: "No active EC2 deployment found" });
+    }
+    const ip = depRows[0].public_ip;
+
+    // Update DB first
+    await db.execute(
+      "UPDATE aba_team_agents SET telegram_bot_token=?, telegram_bot_username=? WHERE id=? AND user_id=?",
+      [bot_token, botUsername, agentId, userId]
+    );
+
+    // Tell agent-server
+    await agentApi(ip, 'POST', '/team/configure-telegram/' + agentId, {
+      bot_token,
+      agent_slug: ta.agent_slug || 'team-' + agentId,
+      agent_name: ta.agent_name,
+      agent_role: ta.role,
+      agent_personality: ta.personality
+    });
+
+    res.json({ success: true, bot_username: botUsername });
+  } catch (err: any) {
+    console.error("Team agent Telegram connect error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Disconnect Telegram for a team agent
+app.post("/api/team-agents/:id/telegram/disconnect", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const agentId = parseInt(req.params.id, 10);
+
+    const [depRows]: any = await db.execute(
+      "SELECT public_ip FROM aba_deployments WHERE user_id=? AND status='active'", [userId]
+    );
+    if (!depRows.length || !depRows[0].public_ip) {
+      return res.status(400).json({ error: "No active EC2 deployment found" });
+    }
+    const ip = depRows[0].public_ip;
+
+    const [taRows]: any = await db.execute(
+      "SELECT agent_slug FROM aba_team_agents WHERE id=? AND user_id=?", [agentId, userId]
+    );
+    const agentSlug = taRows.length ? (taRows[0].agent_slug || 'team-' + agentId) : 'team-' + agentId;
+
+    await agentApi(ip, 'POST', '/team/disconnect-telegram/' + agentId, { agent_slug: agentSlug });
+
+    // Update DB
+    await db.execute(
+      "UPDATE aba_team_agents SET telegram_bot_token=NULL, telegram_bot_username=NULL WHERE id=? AND user_id=?", [agentId, userId]
+    );
+
+    res.json({ success: true, message: 'Telegram disconnected' });
+  } catch (err: any) {
+    console.error("Team agent Telegram disconnect error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ==================== OLD TELEGRAM SETUP (via SSH) ====================
+
+// Set Telegram channel on a deployed EC2 (post-deploy, no re-deploy needed)
+app.post("/api/agent/set-telegram", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const { bot_token } = req.body;
+    if (!bot_token) return res.status(400).json({ error: "bot_token required" });
+
+    // Validate token via Telegram API
+    const valResp = await fetch(`https://api.telegram.org/bot${bot_token}/getMe`);
+    const valData: any = await valResp.json();
+    if (!valData.ok) return res.status(400).json({ error: "Invalid Telegram bot token" });
+    const botUsername = valData.result.username;
+
+    // Get deployment info
+    const [depRows]: any = await db.execute(
+      "SELECT public_ip FROM aba_deployments WHERE user_id=? AND status='active'", [userId]
+    );
+    if (!depRows.length || !depRows[0].public_ip) {
+      return res.status(400).json({ error: "No active EC2 deployment found" });
+    }
+    const ip = depRows[0].public_ip;
+
+    // Save token to DB
+    await db.execute(
+      "UPDATE aba_agent_configs SET telegram_bot_token=?, telegram_bot_username=? WHERE user_id=?",
+      [bot_token, botUsername, userId]
+    );
+
+    // Tell agent-server to configure Telegram (via HTTP)
+    await agentApi(ip, 'POST', '/telegram/configure', { bot_token });
+
+    res.json({ success: true, bot_username: botUsername });
+  } catch (err: any) {
+    console.error("Telegram setup error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`ABA API server running on port ${PORT}`);
