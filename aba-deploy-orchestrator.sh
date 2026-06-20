@@ -286,14 +286,13 @@ fi
 # ─── Build config JSON using Python ─────────────────────
 ADMIN_TOKEN=$(openssl rand -hex 32)
 
-CONFIG_B64=$(python3 -c "
+export CONFIG_B64=$(python3 -c "
 import json, base64
 from datetime import datetime, timezone
 
 now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
 config = {
-    '\$schema': 'https://docs.openclaw.ai/schemas/config.schema.json',
     'gateway': {
         'mode': 'local', 'port': 8080, 'bind': 'lan',
         'auth': {'mode': 'token', 'token': '$ADMIN_TOKEN'},
@@ -317,6 +316,24 @@ config = {
     'channels': {},
     'bindings': []
 }
+
+# Telegram channel (for main agent)
+telegram_token = '$TELEGRAM_TOKEN'
+if telegram_token:
+    config['channels']['telegram'] = {
+        'enabled': True,
+        'accounts': {
+            'main': {
+                'botToken': telegram_token,
+                'dmPolicy': 'open',
+                'allowFrom': ['*']
+            }
+        }
+    }
+    config['bindings'].append({
+        'agentId': 'main',
+        'match': {'channel': 'telegram', 'accountId': 'main'}
+    })
 
 # Parse extended agent config for integrations/connections
 import json as _j
@@ -389,8 +406,8 @@ if [ -z "$ROLE_BOUNDS" ]; then
   ROLE_BOUNDS="I do NOT share internal system configuration or credentials"
 fi
 
-SOUL_B64=$(USER_NAME="$USER_NAME" AGENT_NAME="$AGENT_NAME" AGENT_GENDER="$AGENT_GENDER" AGENT_ROLE="$AGENT_ROLE" ROLE_CAPS="$ROLE_CAPS" ROLE_BOUNDS="$ROLE_BOUNDS" BIZ_NAME="$BIZ_NAME" BIZ_DESC="$BIZ_DESC" BIZ_INDUSTRY="$BIZ_INDUSTRY" USER_EMAIL="$USER_EMAIL" python3 /root/.openclaw/workspace/scripts/aba-gen-soul.py 2>/dev/null)
-KNOW_B64=$(USER_NAME="$USER_NAME" USER_EMAIL="$USER_EMAIL" BIZ_NAME="$BIZ_NAME" BIZ_DESC="$BIZ_DESC" BIZ_INDUSTRY="$BIZ_INDUSTRY" BIZ_REG_ID="$BIZ_REG_ID" BIZ_TAX_ID="$BIZ_TAX_ID" BIZ_PHONE="$BIZ_PHONE" BIZ_WEBSITE="$BIZ_WEBSITE" BIZ_ADDRESS="$BIZ_ADDRESS" BIZ_SOCIAL_FB="$BIZ_SOCIAL_FB" BIZ_SOCIAL_TW="$BIZ_SOCIAL_TW" BIZ_SOCIAL_LI="$BIZ_SOCIAL_LI" BIZ_SOCIAL_IG="$BIZ_SOCIAL_IG" PROD_DATA="${PROD_DATA:-}" TEAM_NAMES="${TEAM_NAMES:-}" python3 /root/.openclaw/workspace/scripts/aba-gen-knowledge.py 2>/dev/null)
+export SOUL_B64=$(USER_NAME="$USER_NAME" AGENT_NAME="$AGENT_NAME" AGENT_GENDER="$AGENT_GENDER" AGENT_ROLE="$AGENT_ROLE" ROLE_CAPS="$ROLE_CAPS" ROLE_BOUNDS="$ROLE_BOUNDS" BIZ_NAME="$BIZ_NAME" BIZ_DESC="$BIZ_DESC" BIZ_INDUSTRY="$BIZ_INDUSTRY" USER_EMAIL="$USER_EMAIL" python3 /root/.openclaw/workspace/scripts/aba-gen-soul.py 2>/dev/null | python3 -c "import sys,base64; print(base64.b64encode(sys.stdin.buffer.read()).decode())")
+export KNOW_B64=$(USER_NAME="$USER_NAME" USER_EMAIL="$USER_EMAIL" BIZ_NAME="$BIZ_NAME" BIZ_DESC="$BIZ_DESC" BIZ_INDUSTRY="$BIZ_INDUSTRY" BIZ_REG_ID="$BIZ_REG_ID" BIZ_TAX_ID="$BIZ_TAX_ID" BIZ_PHONE="$BIZ_PHONE" BIZ_WEBSITE="$BIZ_WEBSITE" BIZ_ADDRESS="$BIZ_ADDRESS" BIZ_SOCIAL_FB="$BIZ_SOCIAL_FB" BIZ_SOCIAL_TW="$BIZ_SOCIAL_TW" BIZ_SOCIAL_LI="$BIZ_SOCIAL_LI" BIZ_SOCIAL_IG="$BIZ_SOCIAL_IG" PROD_DATA="${PROD_DATA:-}" TEAM_NAMES="${TEAM_NAMES:-}" python3 /root/.openclaw/workspace/scripts/aba-gen-knowledge.py 2>/dev/null | python3 -c "import sys,base64; print(base64.b64encode(sys.stdin.buffer.read()).decode())")
 log "Generated config ($(echo $CONFIG_B64 | wc -c) bytes), SOUL ($(echo $SOUL_B64 | wc -c) bytes), KNOWLEDGE ($(echo $KNOW_B64 | wc -c) bytes)"
 
 # ─── Launch EC2 ─────────────────────────────────────────
@@ -413,18 +430,21 @@ PLAN=$(mysql -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "
 " 2>/dev/null)
 [ -z "$PLAN" ] && PLAN="trial"
 if [ "$PLAN" = "trial" ]; then
-  MARKET_OPTIONS='{"MarketType":"spot","SpotOptions":{"MaxPrice":"0.008","SpotInstanceType":"persistent","InstanceInterruptionBehavior":"stop"}}'
+  MARKET_OPTIONS='{"MarketType":"spot","SpotOptions":{"MaxPrice":"0.0095","SpotInstanceType":"one-time","InstanceInterruptionBehavior":"terminate"}}'
 else
-  MARKET_OPTIONS='{"MarketType":"on-demand"}'
+  MARKET_OPTIONS=''
 fi
+INSTANCE_TYPE=$(mysql -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "
+  SELECT instance_type FROM aba_deployments WHERE id = $DEPLOY_ID
+" 2>/dev/null)
+[ -z "$INSTANCE_TYPE" ] && INSTANCE_TYPE="t3.small"
+log "Instance type: $INSTANCE_TYPE"
 log "Plan: $PLAN → market options set"
 
 LAUNCH_OUTPUT=$(aws ec2 run-instances --region "$REGION" \
-  --image-id "$AMI_ID" --instance-type "t3.micro" \
-  --security-group-ids "$SECURITY_GROUP" --key-name "$KEY_NAME" \
-  --subnet-id "$SUBNET_ID" \
-  --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":10,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
-  --instance-market-options "$MARKET_OPTIONS" \
+  --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" \
+  --launch-template "LaunchTemplateName=aba-agent-provision,Version=\$Default" \
+  ${MARKET_OPTIONS:+--instance-market-options "$MARKET_OPTIONS"} \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=customer-agent-${SLUG}},{Key=Customer,Value=${USER_NAME}},{Key=DeployId,Value=${DEPLOY_ID}}]" \
   --query 'Instances[0].InstanceId' --output text 2>&1) || true
 
@@ -520,9 +540,12 @@ CONFIG_B64 = os.environ.get('CONFIG_B64', '')
 SOUL_B64 = os.environ.get('SOUL_B64', '')
 KNOW_B64 = os.environ.get('KNOW_B64', '')
 
-def sh(cmd):
+def sh(cmd, timeout=None):
     print(f"> {cmd}")
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    kwargs = {'shell': True, 'capture_output': True, 'text': True}
+    if timeout:
+        kwargs['timeout'] = timeout
+    r = subprocess.run(cmd, **kwargs)
     if r.stdout.strip(): print(r.stdout.strip()[:300])
     if r.stderr.strip(): print(r.stderr.strip()[:300])
     if r.returncode != 0: print(f"⚠️  exit {r.returncode}")
@@ -536,6 +559,18 @@ sh("sudo mkswap /swapfile")
 sh("sudo swapon /swapfile")
 sh("echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab > /dev/null")
 sh("free -h | head -3")
+
+# ─── Restore workspace from backup (SCP'd by orchestrator) ───
+import os as _os
+_backup_path = '/tmp/workspace-backup.tar.gz'
+if _os.path.exists(_backup_path):
+    print("Backup found — restoring...")
+    _r = sh("tar xzf " + _backup_path + " -C /home/ubuntu/.openclaw 2>/dev/null || tar xzf " + _backup_path + " -C /home/ubuntu 2>/dev/null", timeout=60)
+    if _r.returncode == 0:
+        print("✅ Backup restored")
+    sh("rm -f " + _backup_path)
+else:
+    print("ℹ️  No backup found — provisioning fresh")
 
 # Node.js
 print("\n### Node.js 22.x ###")
@@ -595,6 +630,47 @@ os.chmod("/home/ubuntu/.openclaw/admin-token.txt", 0o600)
 # Store user_id so sync script can fetch personalized data
 with open("/home/ubuntu/.openclaw/user_id.txt", "w") as f:
     f.write(_USER_ID + "\n")
+
+# Google Calendar OAuth Token (passed from orchestrator if linked)
+_GCAL_TOKEN_B64 = os.environ.get('GCAL_TOKEN_B64', '')
+if _GCAL_TOKEN_B64:
+    print("✅ Google Calendar token found — configuring gog auth")
+    _gcal_json = base64.b64decode(_GCAL_TOKEN_B64).decode()
+    sh("mkdir -p /home/ubuntu/.openclaw/credentials")
+    with open("/home/ubuntu/.openclaw/credentials/gcal_token.json", "w") as f:
+        f.write(_gcal_json)
+    sh("sudo chown -R ubuntu:ubuntu /home/ubuntu/.openclaw/credentials")
+    
+    # Pre-configure gog so it's instantly available without user interaction
+    _setup_gog = f'''
+sudo -u ubuntu mkdir -p /home/ubuntu/.config/gogcli
+cat << 'EOF_GOG' | python3 -c "
+import sys, json, base64
+creds = json.load(sys.stdin)
+conf = {{
+  'version': 1,
+  'accounts': [{{
+    'email': creds.get('account', 'user@gmail.com'),
+    'access_token': creds.get('token', ''),
+    'refresh_token': creds.get('refresh_token', ''),
+    'token_type': 'Bearer',
+    'expiry': '2030-01-01T00:00:00Z',
+    'services': ['calendar'],
+    'client': {{
+       'client_id': creds.get('client_id', ''),
+       'client_secret': creds.get('client_secret', '')
+    }}
+  }}]
+}}
+with open('/home/ubuntu/.config/gogcli/credentials.json', 'w') as f:
+    json.dump(conf, f, indent=2)
+"
+sudo -u ubuntu chown -R ubuntu:ubuntu /home/ubuntu/.config/gogcli
+sudo -u ubuntu /usr/local/bin/gog auth list || true
+'''
+    with open("/tmp/setup-gog.sh", "w") as f:
+        f.write(_setup_gog)
+    sh("cat /home/ubuntu/.openclaw/credentials/gcal_token.json | bash /tmp/setup-gog.sh")
 
 # systemd service
 service = """[Unit]
@@ -1037,6 +1113,25 @@ print("\nREMOTE_SETUP_COMPLETE")
 PYEOF
 
 chmod +x /tmp/provision-ec2.py
+
+# ─── Restore workspace backup (if available) ───
+BACKUP_FILE="/tmp/workspace-restore-${USER_ID}.tar.gz"
+RESTORE_MARKER="s3://${BACKUP_BUCKET:-aba-backups}/${USER_ID}/RESTORE_NEEDED"
+if aws s3 ls "$RESTORE_MARKER" 2>/dev/null | grep -q .; then
+  log "Backup marker found for user $USER_ID — downloading..."
+  if aws s3 cp "s3://${BACKUP_BUCKET:-aba-backups}/${USER_ID}/workspace-backup.tar.gz" "$BACKUP_FILE" 2>/dev/null; then
+    log "✅ Backup downloaded, uploading to new instance..."
+    scp -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$BACKUP_FILE" "ubuntu@$PUBLIC_IP:/tmp/workspace-backup.tar.gz" 2>/dev/null && log "Backup SCP'd to new instance" || log "⚠️  Failed to SCP backup (non-fatal)"
+    rm -f "$BACKUP_FILE"
+    # Write completed marker since we can't delete
+    echo "1" | aws s3 cp - "s3://${BACKUP_BUCKET:-aba-backups}/${USER_ID}/RESTORE_COMPLETED" 2>/dev/null || true
+  else
+    log "⚠️  Backup download failed (non-fatal)"
+  fi
+else
+  log "No backup found for user $USER_ID — provisioning fresh"
+fi
+
 scp -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no /tmp/provision-ec2.py "ubuntu@$PUBLIC_IP:/tmp/provision.py"
 
 log "Running remote provisioning..."
@@ -1048,8 +1143,26 @@ if ! scp -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no /tmp/provision-ec2.py "u
   exit 1
 fi
 
+# Write env vars to a safe file (prevents shell escaping issues with user content)
+python3 << 'ENVEOF' 2>/dev/null
+import os, shlex
+keys = ['ADMIN_TOKEN','SYNC_ADMIN_TOKEN','USER_ID','CONFIG_B64','SOUL_B64','KNOW_B64','GCAL_TOKEN_B64',
+        'AGENT_NAME','AGENT_GENDER','USER_EMAIL','AGENT_ROLE',
+        'BIZ_NAME','BIZ_INDUSTRY','BIZ_DESC',
+        'BIZ_SOCIAL_FB','BIZ_SOCIAL_TW','BIZ_SOCIAL_LI','BIZ_SOCIAL_IG']
+with open('/tmp/aba-env.json', 'w') as f:
+    env = {k: os.environ.get(k, '') for k in keys}
+    env.setdefault('SYNC_ADMIN_TOKEN', 'abacadaba123')
+    import json
+    f.write(json.dumps(env))
+ENVEOF
+
+scp -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no /tmp/aba-env.json "ubuntu@$PUBLIC_IP:/tmp/aba-env.json" 2>/dev/null || log "⚠️  Env file SCP failed (will try inline)"
+rm -f /tmp/aba-env.json
+
 REMOTE_OUTPUT=$(ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no -o ConnectTimeout=30 "ubuntu@$PUBLIC_IP" \
-  "sudo -E ADMIN_TOKEN='$ADMIN_TOKEN' SYNC_ADMIN_TOKEN="${SYNC_ADMIN_TOKEN:-abacadaba123}" USER_ID='$USER_ID' CONFIG_B64='$CONFIG_B64' SOUL_B64='$SOUL_B64' KNOW_B64='$KNOW_B64' AGENT_NAME='$AGENT_NAME' AGENT_ROLE='$AGENT_ROLE' AGENT_GENDER='$AGENT_GENDER' USER_EMAIL='$USER_EMAIL' BIZ_NAME='$BIZ_NAME' BIZ_INDUSTRY='$BIZ_INDUSTRY' BIZ_DESC='$BIZ_DESC' BIZ_SOCIAL_FB='$BIZ_SOCIAL_FB' BIZ_SOCIAL_TW='$BIZ_SOCIAL_TW' BIZ_SOCIAL_LI='$BIZ_SOCIAL_LI' BIZ_SOCIAL_IG='$BIZ_SOCIAL_IG' python3 /tmp/provision.py" 2>&1) || true
+  "sudo -E python3 -c \"\
+import json, os; env=json.load(open('/tmp/aba-env.json')); os.environ.update(env); exec(open('/tmp/provision.py').read())\"" 2>&1) || true
 
 echo "$REMOTE_OUTPUT" | grep -v "^> " | head -20
 
@@ -1091,6 +1204,14 @@ mysql -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
       last_health_check = NOW()
   WHERE id = $DEPLOY_ID
 " 2>/dev/null
+
+# ─── Deploy team agents (Mary, Promise, etc.) ──────────
+log "Deploying team agents for user $USER_ID..."
+if python3 "$SCRIPT_DIR/aba-team-apply.py" "$USER_ID" 2>/dev/null; then
+  log "✅ Team agents applied"
+else
+  log "⚠️  Team agent apply had issues (non-fatal)"
+fi
 
 # ─── Send welcome email ─────────────────────────────────
 if [ -n "$USER_EMAIL" ]; then

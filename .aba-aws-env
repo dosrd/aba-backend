@@ -1,0 +1,8 @@
+#!/bin/bash
+# ABA AWS Environment — sourced by aba-deploy-orchestrator.sh
+export REGION="us-east-1"
+export KEY_NAME="aba-agent-provision"
+export SSH_KEY_PATH="/root/.ssh/aba-agent-provision.pem"
+export SECURITY_GROUP="sg-051b1c883ae53e7e4"
+export SUBNET_ID="subnet-05bc56f91112e502f"
+export BACKUP_BUCKET="aba-backups"

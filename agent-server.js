@@ -422,12 +422,14 @@ function createServer() {
         if (!conf.agents.list) conf.agents.list = [];
         const agentExists = conf.agents.list.some(function(a) { return a.id === agentSlug; });
         if (!agentExists) {
+          var agentModel = body.preferred_model && body.preferred_model !== 'default' ? body.preferred_model : undefined;
           conf.agents.list.push({
             id: agentSlug,
             name: agentName,
             description: 'Team agent (WhatsApp routing)',
             workspace: '/home/ubuntu/.openclaw/workspace-' + agentSlug
           });
+          if (agentModel) { conf.agents.list[conf.agents.list.length-1].model = agentModel; }
           // Bootstrap workspace
           bootstrapAgentWorkspace(agentSlug, agentName, body.agent_role || 'Operations Assistant', body.agent_personality || 'Professional');
         }
@@ -575,12 +577,14 @@ function createServer() {
         if (!conf.agents.list) conf.agents.list = [];
         var agentExists = conf.agents.list.some(function(a) { return a.id === agentSlug; });
         if (!agentExists) {
+          var agentModel = body.preferred_model && body.preferred_model !== 'default' ? body.preferred_model : undefined;
           conf.agents.list.push({
             id: agentSlug,
             name: body.agent_name || 'Team Agent ' + agentId,
             description: 'Team agent (' + (body.agent_role || 'Telegram') + ' routing)',
             workspace: '/home/ubuntu/.openclaw/workspace-' + agentSlug
           });
+          if (agentModel) { conf.agents.list[conf.agents.list.length-1].model = agentModel; }
           // Bootstrap workspace
           bootstrapAgentWorkspace(agentSlug, body.agent_name || 'Team Agent ' + agentId, body.agent_role || 'Operations Assistant', body.agent_personality || 'Professional');
         }
@@ -616,6 +620,198 @@ function createServer() {
         });
 
         return json(res, 200, { success: true, message: 'Telegram configured for agent ' + agentId });
+      } catch (e) {
+        return json(res, 500, { error: e.message });
+      }
+    }
+
+    // ───── Email Poller State ─────
+    const emailPollers = {};
+
+    function startEmailPoller(agentKey, config) {
+      if (emailPollers[agentKey]) {
+        clearInterval(emailPollers[agentKey]);
+        delete emailPollers[agentKey];
+      }
+      console.log('Starting email poller for ' + agentKey + ' (' + config.email_address + ')');
+
+      async function checkMail() {
+        try {
+          const imapSimple = require('imap-simple');
+          const imapConfig = {
+            imap: {
+              user: config.email_address,
+              password: config.email_password,
+              host: config.email_pop_host,
+              port: config.email_pop_port || 993,
+              tls: true,
+              tlsOptions: { rejectUnauthorized: false },
+              authTimeout: 15000
+            }
+          };
+
+          const connection = await imapSimple.connect(imapConfig);
+          await connection.openBox('INBOX');
+
+          // Search for unseen emails
+          const searchCriteria = ['UNSEEN'];
+          const fetchOptions = { bodies: ['HEADER', 'TEXT'], markSeen: true, struct: true };
+          const messages = await connection.search(searchCriteria, fetchOptions);
+
+          for (const msg of messages) {
+            const headerPart = msg.parts.find(p => p.which === 'HEADER');
+            if (!headerPart) continue;
+
+            const headers = imapSimple.parseHeader(headerPart.body);
+            const from = (headers.from || [''])[0];
+            const subject = (headers.subject || ['(No subject)'])[0];
+            const to = (headers.to || [''])[0];
+            const date = (headers.date || [''])[0];
+
+            // Get text body
+            let body = '';
+            const textPart = msg.parts.find(p => p.which === 'TEXT');
+            if (textPart) {
+              body = textPart.body.substring(0, 3000);
+            }
+
+            console.log('📧 New email for ' + agentKey + ': from=' + from + ' subject=' + subject);
+
+            // Write to a mail file the agent can read from its workspace
+            const mailDir = '/home/ubuntu/.openclaw/mail/' + agentKey + '/inbox';
+            try { execSync('mkdir -p ' + mailDir); } catch(e) {}
+
+            const mailFile = mailDir + '/' + Date.now() + '.json';
+            const mailData = JSON.stringify({
+              from: from,
+              to: to || '',
+              subject: subject,
+              date: date,
+              body: body,
+              receivedAt: new Date().toISOString()
+            });
+
+            try {
+              execSync('cat > ' + mailFile + ' << MAILEOF\n' + mailData.replace(/'/g, "'\\''") + '\nMAILEOF', { timeout: 5000 });
+            } catch(e) {
+              fs.writeFileSync(mailFile, mailData);
+            }
+          }
+
+          await connection.end();
+          // Update last_checked
+          try {
+            execSync('date +%s > /home/ubuntu/.openclaw/mail/' + agentKey + '/last_check', { timeout: 3000 });
+          } catch(e) {}
+        } catch (e) {
+          console.log('Email poll error for ' + agentKey + ': ' + e.message);
+        }
+      }
+
+      // Poll every 5 minutes
+      checkMail();
+      emailPollers[agentKey] = setInterval(checkMail, 5 * 60 * 1000);
+    }
+
+    function stopEmailPoller(agentKey) {
+      if (emailPollers[agentKey]) {
+        clearInterval(emailPollers[agentKey]);
+        delete emailPollers[agentKey];
+        console.log('Stopped email poller for ' + agentKey);
+      }
+    }
+
+    // ───── Route: POST /team/configure-email/:id ─────
+    if (req.method === 'POST' && req.url.startsWith('/team/configure-email/')) {
+      try {
+        const agentId = req.url.split('/team/configure-email/')[1];
+        if (!agentId || !/^\d+$/.test(agentId)) {
+          return json(res, 400, { error: 'Invalid agent id' });
+        }
+        const body = await parseBody(req);
+        if (!body || !body.email_address || !body.email_password || !body.email_pop_host) {
+          return json(res, 400, { error: 'email_address, email_password, email_pop_host required' });
+        }
+
+        const agentKey = 'team-' + agentId;
+        startEmailPoller(agentKey, body);
+
+        return json(res, 200, { success: true, message: 'Email poller started for agent ' + agentId });
+      } catch (e) {
+        return json(res, 500, { error: e.message });
+      }
+    }
+
+    // ───── Route: POST /agent/configure-email ─────
+    if (req.method === 'POST' && req.url === '/agent/configure-email') {
+      try {
+        const body = await parseBody(req);
+        if (!body || !body.email_address || !body.email_password || !body.email_pop_host) {
+          return json(res, 400, { error: 'email_address, email_password, email_pop_host required' });
+        }
+
+        startEmailPoller('main', body);
+
+        return json(res, 200, { success: true, message: 'Email poller started for main agent' });
+      } catch (e) {
+        return json(res, 500, { error: e.message });
+      }
+    }
+
+    // ───── Route: POST /team/disconnect-email/:id ─────
+    if (req.method === 'POST' && req.url.startsWith('/team/disconnect-email/')) {
+      try {
+        const agentId = req.url.split('/team/disconnect-email/')[1];
+        if (!agentId || !/^\d+$/.test(agentId)) {
+          return json(res, 400, { error: 'Invalid agent id' });
+        }
+        stopEmailPoller('team-' + agentId);
+        // Clean up mail directory
+        try { execSync('rm -rf /home/ubuntu/.openclaw/mail/team-' + agentId, { timeout: 5000 }); } catch(e) {}
+        return json(res, 200, { success: true, message: 'Email disconnected for agent ' + agentId });
+      } catch (e) {
+        return json(res, 500, { error: e.message });
+      }
+    }
+
+    // ───── Route: POST /agent/disconnect-email ─────
+    if (req.method === 'POST' && req.url === '/agent/disconnect-email') {
+      try {
+        stopEmailPoller('main');
+        try { execSync('rm -rf /home/ubuntu/.openclaw/mail/main', { timeout: 5000 }); } catch(e) {}
+        return json(res, 200, { success: true, message: 'Email disconnected for main agent' });
+      } catch (e) {
+        return json(res, 500, { error: e.message });
+      }
+    }
+
+    // ───── Route: GET /agent/email/status ─────
+    if (req.method === 'GET' && req.url === '/agent/email/status') {
+      try {
+        const agents = Object.keys(emailPollers);
+        const statuses = {};
+        for (const key of agents) {
+          const lastCheck = readFile('/home/ubuntu/.openclaw/mail/' + key + '/last_check', 'utf-8');
+          let inbox = [];
+          try {
+            const inboxDir = '/home/ubuntu/.openclaw/mail/' + key + '/inbox';
+            const files = execSync('ls -t ' + inboxDir + ' 2>/dev/null || echo', { timeout: 3000 }).toString().trim().split('\n').filter(Boolean);
+            inbox = files.slice(0, 5).map(f => {
+              const data = readFile(inboxDir + '/' + f);
+              if (data) {
+                try { const parsed = JSON.parse(data); return { from: parsed.from, subject: parsed.subject, date: parsed.date, receivedAt: parsed.receivedAt }; }
+                catch(e) { return { file: f }; }
+              }
+              return { file: f };
+            });
+          } catch(e) {}
+          statuses[key] = {
+            running: true,
+            lastCheck: lastCheck ? new Date(parseInt(lastCheck) * 1000).toISOString() : null,
+            recentEmails: inbox
+          };
+        }
+        return json(res, 200, { statuses });
       } catch (e) {
         return json(res, 500, { error: e.message });
       }
@@ -704,6 +900,150 @@ function createServer() {
         return json(res, 200, { success: true, message: 'Telegram configured' });
       } catch (e) {
         return json(res, 500, { error: e.message });
+      }
+    }
+
+    // ───── Route: POST /team/configure-escalation/:id ─────
+    // Writes escalation and report instructions into the agent's SOUL.md
+    if (req.method === 'POST' && req.url.startsWith('/team/configure-escalation/')) {
+      try {
+        const agentId = req.url.split('/team/configure-escalation/')[1];
+        if (!agentId || !/^\d+$/.test(agentId)) return json(res, 400, { error: 'Invalid agent id' });
+        const body = await parseBody(req);
+        if (!body) return json(res, 400, { error: 'Request body required' });
+
+        const agentSlug = body.agent_slug || 'team-' + agentId;
+        const wsDir = '/home/ubuntu/.openclaw/workspace-' + agentSlug;
+
+        if (!fs.existsSync(wsDir)) {
+          bootstrapAgentWorkspace(agentSlug, body.agent_name || 'Team Agent ' + agentId, body.agent_role || 'Operations Assistant', body.agent_personality || 'Professional');
+        }
+
+        const soulPath = wsDir + '/SOUL.md';
+        var soulContent = '';
+        try { soulContent = fs.readFileSync(soulPath, 'utf-8'); } catch {}
+
+        // Remove any previous escalation section to avoid stacking
+        soulContent = soulContent.replace(/\n*## Escalation & Reporting[\s\S]*$/, '');
+
+        // Build escalation block
+        var escBlock = '\n\n## Escalation & Reporting\n';
+        if (body.associate_name) {
+          escBlock += '\n**Escalation Contact:** ' + body.associate_name;
+          if (body.associate_role) escBlock += ' (' + body.associate_role + ')';
+          escBlock += '\n';
+          if (body.associate_email) escBlock += '- Email: ' + body.associate_email + '\n';
+          if (body.associate_mobile) escBlock += '- Phone: ' + body.associate_mobile + '\n';
+        }
+        if (body.instructions) {
+          escBlock += '\n**Escalation Rules:**\n' + body.instructions + '\n';
+        }
+        escBlock += '\n**End-of-Day Report:** Send a summary of completed tasks, pending items, and any issues to the escalation contact at ' + body.report_time + ' ' + (body.report_frequency || 'daily') + '.\n';
+        if (body.associate_email) {
+          escBlock += '- Format: email to ' + body.associate_email + '\n';
+        }
+        if (body.associate_mobile) {
+          escBlock += '- Format: WhatsApp message to ' + body.associate_mobile + '\n';
+        }
+        escBlock += '- Include: tasks completed, pending items, issues encountered, recommendations\n';
+
+        fs.writeFileSync(soulPath, soulContent + escBlock);
+
+        return json(res, 200, { success: true, message: 'Escalation configured for agent ' + agentId });
+      } catch (e) {
+        return json(res, 500, { error: e.message });
+      }
+    }
+
+    // ───── Route: POST /team/update-model/:id ─────
+    // Updates the model override for an existing team agent in agents.list and restarts OpenClaw
+    if (req.method === 'POST' && req.url.startsWith('/team/update-model/')) {
+      try {
+        const agentId = req.url.split('/team/update-model/')[1];
+        if (!agentId || !/^\d+$/.test(agentId)) return json(res, 400, { error: 'Invalid agent id' });
+        const body = await parseBody(req);
+        if (!body) return json(res, 400, { error: 'Request body required' });
+
+        var confPath = process.env.OPENCLAW_CONF || '/home/ubuntu/.openclaw/openclaw.json';
+        var confStr = '{}';
+        try { confStr = fs.readFileSync(confPath, 'utf-8'); } catch {}
+        var conf = JSON.parse(confStr);
+
+        if (!conf.agents) conf.agents = { list: [] };
+        if (!conf.agents.list) conf.agents.list = [];
+
+        var agentSlug = body.agent_slug || 'team-' + agentId;
+        var found = false;
+        for (var i = 0; i < conf.agents.list.length; i++) {
+          if (conf.agents.list[i].id === agentSlug) {
+            var modelVal = body.preferred_model && body.preferred_model !== '' && body.preferred_model !== 'default' ? body.preferred_model : undefined;
+            if (modelVal) {
+              conf.agents.list[i].model = modelVal;
+            } else {
+              delete conf.agents.list[i].model;
+            }
+            found = true;
+            break;
+          }
+        }
+
+        if (!found) {
+          // Add new entry
+          conf.agents.list.push({
+            id: agentSlug,
+            name: body.agent_name || 'Team Agent ' + agentId,
+            description: 'Team agent (' + (body.agent_role || 'Operations') + ' routing)',
+            workspace: '/home/ubuntu/.openclaw/workspace-' + agentSlug
+          });
+          var modelVal = body.preferred_model && body.preferred_model !== '' && body.preferred_model !== 'default' ? body.preferred_model : undefined;
+          if (modelVal) {
+            conf.agents.list[conf.agents.list.length - 1].model = modelVal;
+          }
+        }
+
+        fs.writeFileSync(confPath, JSON.stringify(conf, null, 2));
+
+        // Restart OpenClaw
+        var child = require('child_process');
+        child.exec('openclaw gateway restart', { timeout: 15000 }, function(e) {
+          if (e) console.error('Restart error:', e.message);
+        });
+
+        return json(res, 200, { success: true, message: 'Model updated for agent ' + agentSlug });
+      } catch (e) {
+        return json(res, 500, { error: e.message });
+      }
+    }
+
+    // ───── Route: GET /workspace/:slug/download ─────
+    if (req.method === 'GET' && req.url.startsWith('/workspace/') && req.url.endsWith('/download')) {
+      const slug = req.url.split('/workspace/')[1].split('/download')[0];
+      if (!slug) { json(res, 400, { error: 'Missing agent slug' }); return; }
+      const workspaceDir = '/home/ubuntu/.openclaw/workspace-' + slug;
+      if (!fs.existsSync(workspaceDir)) {
+        const mainDir = '/home/ubuntu/.openclaw/workspace';
+        if (fs.existsSync(mainDir) && slug !== 'main') { json(res, 404, { error: 'No workspace found for this agent' }); return; }
+      }
+      try {
+        const zipPath = '/tmp/workspace-' + slug + '-' + Date.now() + '.tar.gz';
+        execSync('cd /home/ubuntu/.openclaw && tar -czf ' + zipPath + ' workspace-' + slug + ' 2>/dev/null', { timeout: 30000, stdio: 'pipe' });
+        if (!fs.existsSync(zipPath)) { json(res, 500, { error: 'Failed to create zip' }); return; }
+        const stat = fs.statSync(zipPath);
+        res.writeHead(200, {
+          'Content-Type': 'application/gzip',
+          'Content-Disposition': 'attachment; filename="workspace-' + slug + '.tar.gz"',
+          'Content-Length': stat.size,
+          'Access-Control-Allow-Origin': '*'
+        });
+        const readStream = fs.createReadStream(zipPath);
+        readStream.pipe(res);
+        readStream.on('end', function() {
+          try { fs.unlinkSync(zipPath); } catch {}
+        });
+        return;
+      } catch (e) {
+        json(res, 500, { error: 'Failed to zip workspace: ' + e.message });
+        return;
       }
     }
 

@@ -12,9 +12,6 @@ import dotenv from "dotenv";
 import cors from "cors";
 import { execSync, exec, spawn as _spawnTeam, spawn } from "child_process";
 import { fileURLToPath } from "url";
-import { OAuth2Client } from "google-auth-library";
-import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
@@ -106,88 +103,6 @@ async function initDB() {
       console.log("  ✅ aba_deployments columns added");
     }
   } catch(e: any) { console.log("  ⚠️ deployments migration:", e.message); }
-  try {
-    await db.execute(`CREATE TABLE IF NOT EXISTS aba_bank_accounts (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      user_id INT NOT NULL,
-      country VARCHAR(64) NOT NULL,
-      bank_name VARCHAR(128) NOT NULL,
-      account_number VARCHAR(64) NOT NULL,
-      routing_number VARCHAR(64) DEFAULT NULL,
-      account_name VARCHAR(255) NOT NULL,
-      is_primary BOOLEAN DEFAULT FALSE,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    )`);
-    console.log("  ✅ aba_bank_accounts table ready");
-  try {
-    await db.execute("ALTER TABLE aba_businesses ADD COLUMN primary_currency VARCHAR(8) DEFAULT 'USD'");
-    console.log("  ✅ aba_businesses.primary_currency added");
-  } catch(e: any) { console.log("  ⚠️ businesses.primary_currency:", e.message); }
-  try {
-    await db.execute("ALTER TABLE aba_bank_accounts ADD COLUMN currency VARCHAR(8) DEFAULT 'USD'");
-    console.log("  ✅ aba_bank_accounts.currency added");
-  } catch(e: any) { console.log("  ⚠️ bank_accounts.currency:", e.message); }
-
-  } catch(e: any) { console.log("  ⚠️ bank accounts table:", e.message); }
-
-  // ===== Custom Databases Migration =====
-  try {
-    await db.execute(`CREATE TABLE IF NOT EXISTS aba_custom_databases (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      user_id INT NOT NULL,
-      name VARCHAR(255) DEFAULT '',
-      db_type VARCHAR(16) DEFAULT 'mysql',
-      db_host VARCHAR(255) DEFAULT '',
-      db_port INT DEFAULT 3306,
-      db_name VARCHAR(255) DEFAULT '',
-      db_user VARCHAR(255) DEFAULT '',
-      db_pass VARCHAR(255) DEFAULT '',
-      connection_string TEXT,
-      is_primary BOOLEAN DEFAULT FALSE,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    )`);
-    console.log("  ✅ aba_custom_databases table ready");
-  } catch(e: any) { console.log("  ⚠️ aba_custom_databases:", e.message); }
-
-  // ===== Email Sources Migration =====
-  try {
-    await db.execute(`CREATE TABLE IF NOT EXISTS aba_email_sources (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      user_id INT NOT NULL,
-      name VARCHAR(255) DEFAULT '',
-      email_address VARCHAR(255) DEFAULT '',
-      pop_host VARCHAR(255) DEFAULT '',
-      pop_port INT DEFAULT 993,
-      pop_user VARCHAR(255) DEFAULT '',
-      pop_pass VARCHAR(255) DEFAULT '',
-      instruction TEXT,
-      is_primary BOOLEAN DEFAULT FALSE,
-      enabled BOOLEAN DEFAULT TRUE,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    )`);
-    console.log("  ✅ aba_email_sources table ready");
-  } catch(e: any) { console.log("  ⚠️ aba_email_sources:", e.message); }
-
-  // ===== Ecommerce Stores Migration =====
-  try {
-    await db.execute(`CREATE TABLE IF NOT EXISTS aba_ecommerce_stores (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      user_id INT NOT NULL,
-      name VARCHAR(255) DEFAULT '',
-      store_type VARCHAR(32) DEFAULT 'woocommerce',
-      url VARCHAR(255) DEFAULT '',
-      api_key VARCHAR(255) DEFAULT '',
-      api_secret VARCHAR(255) DEFAULT '',
-      access_token VARCHAR(255) DEFAULT '',
-      is_primary BOOLEAN DEFAULT FALSE,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    )`);
-    console.log("  ✅ aba_ecommerce_stores table ready");
-  } catch(e: any) { console.log("  ⚠️ aba_ecommerce_stores:", e.message); }
 }
 initDB().catch(err => { console.error("DB connection error:", err); process.exit(1); });
 
@@ -209,6 +124,81 @@ function getStripe() {
     stripeClient = new Stripe(key);
   }
   return stripeClient;
+}
+
+// ==================== PLAN CONFIGURATION ====================
+const PLANS: Record<string, {
+  label: string;
+  price: number;
+  maxAgents: number;
+  instanceType: string;
+  serverLabel: string;
+  features: { customRoles: boolean; customDb: boolean; twilio: boolean };
+  support: string;
+}> = {
+  trial: {
+    label: 'Trial',
+    price: 0,
+    maxAgents: 2,
+    instanceType: 't3.small',
+    serverLabel: 'ABA-1 (2GB)',
+    features: { customRoles: false, customDb: false, twilio: false },
+    support: 'Email (48h)',
+  },
+  solo: {
+    label: 'Solo',
+    price: 49,
+    maxAgents: 2,
+    instanceType: 't3.small',
+    serverLabel: 'ABA-1 (2GB)',
+    features: { customRoles: false, customDb: false, twilio: false },
+    support: 'Email (48h)',
+  },
+  pro: {
+    label: 'Pro',
+    price: 119,
+    maxAgents: 5,
+    instanceType: 't3.medium',
+    serverLabel: 'ABA-2 (4GB)',
+    features: { customRoles: true, customDb: true, twilio: true },
+    support: 'Priority email (24h)',
+  },
+  enterprise: {
+    label: 'Enterprise',
+    price: 249,
+    maxAgents: 999,
+    instanceType: 't3.large',
+    serverLabel: 'ABA-3 (8GB)',
+    features: { customRoles: true, customDb: true, twilio: true },
+    support: 'Direct WhatsApp/Slack (1h)',
+  },
+};
+
+function planLimit(planKey: string): number {
+  return PLANS[planKey]?.maxAgents ?? 2;
+}
+
+function planFeatures(planKey: string) {
+  return PLANS[planKey]?.features ?? { customRoles: false, customDb: false, twilio: false };
+}
+
+function planInstanceType(planKey: string): string {
+  return PLANS[planKey]?.instanceType ?? 't3.small';
+}
+
+function planServerLabel(planKey: string): string {
+  return PLANS[planKey]?.serverLabel ?? 'ABA-1 (2GB)';
+}
+
+// Normalize plan names from frontend (e.g., "Solo", "Pro") to lowercase slugs
+function normalizePlanSlug(name: string): string {
+  if (!name) return 'solo';
+  const lower = name.toLowerCase().trim();
+  if (lower === 'enterprise' || lower === 'pro' || lower === 'solo' || lower === 'trial') return lower;
+  // Map display names
+  if (lower.startsWith('enter')) return 'enterprise';
+  if (lower === 'standard' || lower === 'entry') return 'solo';
+  return 'solo';
 }
 
 const app = express();
@@ -243,11 +233,27 @@ app.post("/api/stripe-webhook", express.raw({ type: 'application/json' }), async
         }
 
         if (userId) {
+          // Normalize plan slug from frontend human-readable name
+          const planSlug = normalizePlanSlug(session.metadata?.plan || 'solo');
           // Insert new subscription record
           await db.execute(
             "INSERT INTO aba_subscriptions (user_id, plan, status, stripe_subscription_id, current_period_start, current_period_end) VALUES (?, ?, 'active', ?, NOW(), DATE_ADD(NOW(), INTERVAL 1 MONTH))",
-            [userId, session.metadata?.plan || "entry", session.subscription || ""]
+            [userId, planSlug, session.subscription || ""]
           );
+
+          // Record invoice for this payment
+          try {
+            const amountTotal = (session.amount_total || 0) / 100;
+            const invoiceUrl = session.invoice ? `https://dashboard.stripe.com/invoice/${session.invoice}` : null;
+            await db.execute(
+              `INSERT INTO aba_invoices (user_id, stripe_invoice_id, amount, currency, status, invoice_url, period_start, period_end)
+               VALUES (?, ?, ?, ?, 'paid', ?, NOW(), DATE_ADD(NOW(), INTERVAL 1 MONTH))`,
+              [userId, session.id || `cs_${Date.now()}`, amountTotal, session.currency || 'usd', invoiceUrl]
+            );
+            console.log(`Invoice recorded for user ${userId}: $${amountTotal}`);
+          } catch (invErr: any) {
+            console.error("Failed to record invoice:", invErr.message);
+          }
           // Link Stripe customer
           if (session.customer) {
             await db.execute("UPDATE aba_users SET stripe_customer_id=? WHERE id=?", [session.customer, userId]);
@@ -257,12 +263,32 @@ app.post("/api/stripe-webhook", express.raw({ type: 'application/json' }), async
           if (isUpgrade) {
             console.log(`Upgrade detected for user ${userId} — beginning migration...`);
             try {
-              // 1. Find and terminate old EC2 spot instance
+              // 1. Find old EC2 instance
               const [depRows]: any = await db.execute(
-                "SELECT id, instance_id FROM aba_deployments WHERE user_id=? AND status IN ('active','provisioning','failed')", [userId]
+                "SELECT id, instance_id, public_ip FROM aba_deployments WHERE user_id=? AND status IN ('active','provisioning','failed')", [userId]
               );
               if (depRows.length > 0) {
                 const dep = depRows[0];
+
+                // 1a. Backup workspace to S3 before terminate
+                if (dep.public_ip && dep.instance_id) {
+                  try {
+                    const migrate = session.metadata?.migrate === 'true';
+                    if (migrate) {
+                      const backupScript = '/root/.openclaw/workspace/scripts/aba-backup-workspace.py';
+                      const backupCmd = `python3 ${backupScript} ${dep.public_ip} ${process.env.SSH_KEY_PATH || '/root/.ssh/aba-agent-provision.pem'} ${userId}`;
+                      execSync(backupCmd, { timeout: 120000, stdio: 'pipe', env: { ...process.env, USER_ID: String(userId) } });
+                      console.log(`Workspace backed up for user ${userId} before migration`);
+                    } else {
+                      console.log(`Migration without backup for user ${userId}`);
+                    }
+                  } catch (be: any) {
+                    // Non-fatal — proceed with termination even if backup fails
+                    console.error(`Backup warning for user ${userId}:`, be.message);
+                  }
+                }
+
+                // 1b. Terminate old EC2 instance
                 if (dep.instance_id) {
                   try {
                     execSync(`aws ec2 terminate-instances --instance-ids ${dep.instance_id} --region us-east-1`, { timeout: 15000, stdio: 'pipe' });
@@ -271,13 +297,14 @@ app.post("/api/stripe-webhook", express.raw({ type: 'application/json' }), async
                     console.error(`Failed to terminate instance ${dep.instance_id}:`, e.message);
                   }
                 }
-                // 2. Re-queue deployment as pending (orchestrator will pick up with on-demand)
-                const bindCode = require('crypto').randomBytes(4).toString('hex');
+                // 2. Re-queue deployment as pending (orchestrator will pick up with appropriate instance type)
+                const bindCode = crypto.randomBytes(4).toString('hex');
+                const newInstanceType = planInstanceType(planSlug);
                 await db.execute(
-                  "UPDATE aba_deployments SET status='pending', instance_id=NULL, public_ip=NULL, admin_token=NULL, error_message=NULL, deploy_id=NULL, telegram_bot_username=NULL, last_health_check=NULL, deployed_at=NULL, bind_code=? WHERE id=?",
-                  [bindCode, dep.id]
+                  "UPDATE aba_deployments SET status='pending', instance_type=?, instance_id=NULL, public_ip=NULL, admin_token=NULL, error_message=NULL, telegram_bot_username=NULL, last_health_check=NULL, deployed_at=NULL, bind_code=? WHERE id=?",
+                  [newInstanceType, bindCode, dep.id]
                 );
-                console.log(`Re-queued deployment #${dep.id} for user ${userId} — orchestrator will provision on-demand`);
+                console.log(`Re-queued deployment #${dep.id} for user ${userId} — plan=${planSlug}, instance=${newInstanceType}`);
               }
             } catch (migrateErr: any) {
               console.error("Migration error:", migrateErr.message);
@@ -329,32 +356,55 @@ function authMiddleware(req: any, res: any, next: any) {
 
 app.post("/api/auth/register", async (req, res) => {
   try {
-    const { email, password, name } = req.body;
+    const { email, password, name, business_name } = req.body;
     if (!email || !password) return res.status(400).json({ error: "Email and password required" });
     const [existing]: any = await db.execute("SELECT id FROM aba_users WHERE email = ?", [email]);
     if (existing.length > 0) return res.status(400).json({ error: "Email already registered" });
     const hash = await bcrypt.hash(password, 10);
+    const verificationToken = crypto.randomBytes(32).toString("hex");
+    const bizName = business_name || name || email.split("@")[0];
     const result: any = await db.execute(
-      "INSERT INTO aba_users (email, password_hash, name) VALUES (?, ?, ?)",
-      [email, hash, name || email.split("@")[0]]
+      "INSERT INTO aba_users (email, password_hash, name, business_name, verification_token) VALUES (?, ?, ?, ?, ?)",
+      [email, hash, name || email.split("@")[0], bizName, verificationToken]
     );
     const userId = result[0].insertId;
     await db.execute(
       "INSERT INTO aba_subscriptions (user_id, plan, status) VALUES (?, 'trial', 'active')",
       [userId]
     );
-    // Set 14-day trial expiry in user metadata or a separate expiry field
     await db.execute(
       "INSERT INTO aba_agent_configs (user_id, agent_name, personality) VALUES (?, 'My Assistant', 'Professional')",
       [userId]
     );
-    const token = jwt.sign({ userId }, JWT_SECRET, { expiresIn: "30d" });
-    const [user]: any = await db.execute("SELECT id, email, name FROM aba_users WHERE id = ?", [userId]);
-    res.json({ token, user: user[0] });
-    sendWelcomeEmail(email, name || email.split("@")[0]).catch(() => {});
+
+    // Send verification email
+    const transporter = getMailTransporter();
+    const verifyUrl = "https://dabarobjects.com/api/auth/verify-email?token=" + verificationToken;
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM || "ABA <no-reply-pawpaw@storeharmony.com>",
+      to: email,
+      subject: "Verify your ABA account",
+      html: `<div style="max-width:480px;margin:40px auto;font-family:sans-serif;padding:24px;border:1px solid #e5e7eb;border-radius:16px;"><div style="background:#f59e0b;width:48px;height:48px;border-radius:12px;display:flex;align-items:center;justify-content:center;margin-bottom:16px;"><span style="font-size:24px;color:#0f172a;font-weight:bold;">ABA</span></div><h2 style="margin:0 0 8px;color:#0f172a;">Welcome to ABA, ${name || email.split("@")[0]}!</h2><p style="color:#64748b;margin:0 0 24px;line-height:1.6;">You are one step away from launching your AI workforce. Click the button below to verify your email address.</p><a href="${verifyUrl}" style="display:inline-block;background:#f59e0b;color:#0f172a;padding:12px 32px;border-radius:12px;text-decoration:none;font-weight:bold;">Verify Email Address</a><p style="color:#94a3b8;font-size:12px;margin-top:24px;">If you did not sign up for ABA, you can ignore this email.</p></div>`
+    });
+
+    res.json({ message: "Account created! Check your email to verify your address.", needsVerification: true });
   } catch (err: any) {
     console.error("Register error:", err);
     res.status(500).json({ error: "Registration failed" });
+  }
+});
+
+app.get("/api/auth/verify-email", async (req, res) => {
+  try {
+    const token = req.query.token;
+    if (!token) return res.status(400).send("Missing verification token.");
+    const [rows]: any = await db.execute("SELECT id FROM aba_users WHERE verification_token = ?", [token]);
+    if (rows.length === 0) return res.status(400).send("Invalid or expired verification link.");
+    await db.execute("UPDATE aba_users SET is_verified = 1, verification_token = NULL WHERE id = ?", [rows[0].id]);
+    res.redirect("https://dabarobjects.com/#/login?verified=true");
+  } catch (err: any) {
+    console.error("Verify error:", err);
+    res.status(500).send("Verification failed.");
   }
 });
 
@@ -362,13 +412,14 @@ app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: "Email and password required" });
-    const [rows]: any = await db.execute("SELECT id, email, name, password_hash FROM aba_users WHERE email = ?", [email]);
+    const [rows]: any = await db.execute("SELECT id, email, name, business_name, password_hash, is_verified FROM aba_users WHERE email = ?", [email]);
     if (rows.length === 0) return res.status(400).json({ error: "Invalid email or password" });
     const user = rows[0];
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) return res.status(400).json({ error: "Invalid email or password" });
+    if (!user.is_verified) return res.status(403).json({ error: "Please verify your email before signing in. Check your inbox for the verification link.", needsVerification: true });
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: "30d" });
-    res.json({ token, user: { id: user.id, email: user.email, name: user.name } });
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name, business_name: user.business_name } });
   } catch (err: any) {
     console.error("Login error:", err);
     res.status(500).json({ error: "Login failed" });
@@ -377,25 +428,25 @@ app.post("/api/auth/login", async (req, res) => {
 
 app.post("/api/auth/google", async (req, res) => {
   try {
-    const { email, name, googleId } = req.body;
+    const { email, name, googleId, business_name } = req.body;
     if (!email || !googleId) return res.status(400).json({ error: "Email and Google ID required" });
-    let [rows]: any = await db.execute("SELECT id, email, name FROM aba_users WHERE email = ?", [email]);
+    let [rows]: any = await db.execute("SELECT id, email, name, business_name FROM aba_users WHERE email = ?", [email]);
     if (rows.length === 0) {
       await db.execute(
-        "INSERT INTO aba_users (email, name, google_id) VALUES (?, ?, ?)",
-        [email, name || email.split("@")[0], googleId]
+        "INSERT INTO aba_users (email, name, business_name, google_id, is_verified) VALUES (?, ?, ?, ?, 1)",
+        [email, name || email.split("@")[0], business_name || name || email.split("@")[0], googleId]
       );
-      const [nr]: any = await db.execute("SELECT id, email, name FROM aba_users WHERE email = ?", [email]);
+      const [nr]: any = await db.execute("SELECT id, email, name, business_name FROM aba_users WHERE email = ?", [email]);
       rows = nr;
       const userId = rows[0].id;
       await db.execute("INSERT INTO aba_subscriptions (user_id, plan, status) VALUES (?, 'trial', 'active')", [userId]);
       await db.execute("INSERT INTO aba_agent_configs (user_id, agent_name, personality) VALUES (?, 'My Assistant', 'Professional')", [userId]);
     } else {
-      await db.execute("UPDATE aba_users SET google_id = ? WHERE email = ?", [googleId, email]);
+      await db.execute("UPDATE aba_users SET google_id = ?, is_verified = 1 WHERE email = ?", [googleId, email]);
     }
     const user = rows[0];
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: "30d" });
-    res.json({ token, user });
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name, business_name: user.business_name } });
   } catch (err: any) {
     console.error("Google auth error:", err);
     res.status(500).json({ error: "Google auth failed" });
@@ -512,24 +563,24 @@ app.get("/api/business", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
     const [rows]: any = await db.execute("SELECT * FROM aba_businesses WHERE user_id = ?", [userId]);
-    res.json(rows.length > 0 ? rows[0] : { business_name: "", primary_currency: "USD" });
+    res.json(rows.length > 0 ? rows[0] : { business_name: "" });
   } catch { res.status(500).json({ error: "Failed to fetch business" }); }
 });
 
 app.put("/api/business", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const { business_name, description, industry, registration_id, tax_id, phone, website, address, logo_url, social_facebook, social_twitter, social_linkedin, social_instagram, primary_currency } = req.body;
+    const { business_name, description, industry, registration_id, tax_id, phone, website, address, logo_url, social_facebook, social_twitter, social_linkedin, social_instagram } = req.body;
     const [existing]: any = await db.execute("SELECT id FROM aba_businesses WHERE user_id = ?", [userId]);
     if (existing.length > 0) {
       await db.execute(
-        "UPDATE aba_businesses SET business_name=?, description=?, industry=?, registration_id=?, tax_id=?, phone=?, website=?, address=?, logo_url=?, social_facebook=?, social_twitter=?, social_linkedin=?, social_instagram=?, primary_currency=? WHERE user_id=?",
-        [business_name, description, industry, registration_id || '', tax_id || '', phone, website, address, logo_url, social_facebook || '', social_twitter || '', social_linkedin || '', social_instagram || '', primary_currency || 'USD', userId]
+        "UPDATE aba_businesses SET business_name=?, description=?, industry=?, registration_id=?, tax_id=?, phone=?, website=?, address=?, logo_url=?, social_facebook=?, social_twitter=?, social_linkedin=?, social_instagram=? WHERE user_id=?",
+        [business_name, description, industry, registration_id || '', tax_id || '', phone, website, address, logo_url, social_facebook || '', social_twitter || '', social_linkedin || '', social_instagram || '', userId]
       );
     } else {
       await db.execute(
-        "INSERT INTO aba_businesses (user_id, business_name, description, industry, registration_id, tax_id, phone, website, address, logo_url, social_facebook, social_twitter, social_linkedin, social_instagram, primary_currency) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [userId, business_name, description, industry, registration_id || '', tax_id || '', phone, website, address, logo_url, social_facebook || '', social_twitter || '', social_linkedin || '', social_instagram || '', primary_currency || 'USD']
+        "INSERT INTO aba_businesses (user_id, business_name, description, industry, registration_id, tax_id, phone, website, address, logo_url, social_facebook, social_twitter, social_linkedin, social_instagram) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [userId, business_name, description, industry, registration_id || '', tax_id || '', phone, website, address, logo_url, social_facebook || '', social_twitter || '', social_linkedin || '', social_instagram || '']
       );
     }
     const [rows]: any = await db.execute("SELECT * FROM aba_businesses WHERE user_id = ?", [userId]);
@@ -543,13 +594,6 @@ app.get("/api/products", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
     const [rows]: any = await db.execute("SELECT * FROM aba_products WHERE user_id = ? ORDER BY created_at DESC", [userId]);
-    // Resolve S3 keys to presigned URLs
-    for (const row of rows) {
-      row.image = row.image || null;
-      if (row.image_s3_key && !row.image?.startsWith('http')) {
-        row.image = await getPresignedUrl(row.image_s3_key, 86400);
-      }
-    }
     res.json(rows);
   } catch { res.status(500).json({ error: "Failed to fetch products" }); }
 });
@@ -557,14 +601,12 @@ app.get("/api/products", authMiddleware, async (req, res) => {
 app.post("/api/products", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const { name, description, price, category, image } = req.body;
-    const s3Key = image && !image.startsWith('/uploads/') ? image : null;
+    const { name, description, price, category } = req.body;
     const result: any = await db.execute(
-      "INSERT INTO aba_products (user_id, name, description, price, category, image, image_s3_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [userId, name, description, price, category, s3Key || image || null, s3Key]
+      "INSERT INTO aba_products (user_id, name, description, price, category) VALUES (?, ?, ?, ?, ?)",
+      [userId, name, description, price, category]
     );
     const [rows]: any = await db.execute("SELECT * FROM aba_products WHERE id = ?", [result[0].insertId]);
-    if (rows[0].image_s3_key) rows[0].image = await getPresignedUrl(rows[0].image_s3_key, 86400);
     res.json(rows[0]);
   } catch { res.status(500).json({ error: "Failed to create product" }); }
 });
@@ -572,12 +614,9 @@ app.post("/api/products", authMiddleware, async (req, res) => {
 app.put("/api/products/:id", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const { name, description, price, category, image } = req.body;
-    const s3Key = image && !image.startsWith('/uploads/') ? image : null;
-    await db.execute("UPDATE aba_products SET name=?, description=?, price=?, category=?, image=?, image_s3_key=? WHERE id=? AND user_id=?",
-      [name, description, price, category, s3Key || image || null, s3Key, req.params.id, userId]);
+    const { name, description, price, category } = req.body;
+    await db.execute("UPDATE aba_products SET name=?, description=?, price=?, category=? WHERE id=? AND user_id=?", [name, description, price, category, req.params.id, userId]);
     const [rows]: any = await db.execute("SELECT * FROM aba_products WHERE id = ?", [req.params.id]);
-    if (rows[0].image_s3_key) rows[0].image = await getPresignedUrl(rows[0].image_s3_key, 86400);
     res.json(rows[0]);
   } catch { res.status(500).json({ error: "Failed to update product" }); }
 });
@@ -585,14 +624,6 @@ app.put("/api/products/:id", authMiddleware, async (req, res) => {
 app.delete("/api/products/:id", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    // Get S3 key before deleting so we can clean up
-    const [existing]: any = await db.execute("SELECT image_s3_key FROM aba_products WHERE id=? AND user_id=?", [req.params.id, userId]);
-    if (existing.length > 0 && existing[0].image_s3_key) {
-      try {
-        await s3Client.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: existing[0].image_s3_key }));
-      } catch {}
-      await db.execute("DELETE FROM aba_storage_usage WHERE user_id=? AND s3_key=?", [userId, existing[0].image_s3_key]);
-    }
     await db.execute("DELETE FROM aba_products WHERE id = ? AND user_id = ?", [req.params.id, userId]);
     res.json({ success: true });
   } catch { res.status(500).json({ error: "Failed to delete product" }); }
@@ -698,7 +729,30 @@ app.post("/api/team-agents", authMiddleware, async (req, res) => {
     const { agent_name, gender, role, personality, telegram_bot_token, bot_name, welcome_message, whatsapp_number, custom_instructions, agent_slug } = req.body;
 
     if (!agent_name) return res.status(400).json({ error: "Agent name required" });
-    // Channels are linked post-creation from the Manage page — not required at creation time
+
+    // === PLAN ENFORCEMENT: agent count limit ===
+    const [subRows]: any = await db.execute(
+      "SELECT plan FROM aba_subscriptions WHERE user_id=? AND status='active' ORDER BY created_at DESC LIMIT 1", [userId]
+    );
+    const currentPlan = (subRows.length > 0 ? subRows[0].plan : 'trial') as string;
+    const limit = planLimit(currentPlan);
+
+    const [countRows]: any = await db.execute(
+      "SELECT COUNT(*) as cnt FROM aba_team_agents WHERE user_id=?", [userId]
+    );
+    const agentCount = countRows[0]?.cnt || 0;
+
+    if (agentCount >= limit) {
+      return res.status(403).json({
+        error: `Your ${PLANS[currentPlan]?.label || 'current'} plan allows up to ${limit} agent${limit === 1 ? '' : 's'}. Upgrade to create more.`,
+        code: 'AGENT_LIMIT_REACHED',
+        currentPlan,
+        currentAgents: agentCount,
+        maxAgents: limit,
+        upgradeUrl: '/#/dashboard/subscription',
+      });
+    }
+    // === END PLAN ENFORCEMENT ===
 
     const result = await db.execute(
       `INSERT INTO aba_team_agents (user_id, agent_name, gender, role, agent_slug, personality, telegram_bot_token, bot_name, welcome_message, whatsapp_number, custom_instructions)
@@ -706,7 +760,7 @@ app.post("/api/team-agents", authMiddleware, async (req, res) => {
       [userId, agent_name, gender || 'Female', role || null, agent_slug || null, personality || 'Professional', telegram_bot_token || null, bot_name || '', welcome_message || '', whatsapp_number || null, custom_instructions || null]
     );
 
-    res.json({ success: true, id: (result as any)[0]?.insertId });
+    res.json({ success: true, id: (result as any)[0]?.insertId, agentCount: agentCount + 1, maxAgents: limit });
   } catch (err: any) {
     console.error("Create team agent error:", err);
     res.status(500).json({ error: "Failed to create team agent" });
@@ -776,20 +830,19 @@ app.post("/api/team-agents/launch", authMiddleware, async (req, res) => {
   }
 });
 
-// ==================== AGENT TEMPLATES (Roles / Marketplace) ====================
+// ==================== AGENT TEMPLATES ====================
 
 app.get("/api/agent-templates", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
     const [userRows]: any = await db.execute("SELECT selected_template FROM aba_users WHERE id = ?", [userId]);
     const activeSlug = userRows[0]?.selected_template || null;
-    // Return own templates + global templates, exclude system admin
+    // Only return team-agent templates (is_system_admin=0), not the hidden system admin template
     const [rows]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE (is_global=1 OR user_id=?) AND is_system_admin=0 ORDER BY is_global DESC, id ASC", [userId]);
-    for (const r of rows) {
+    rows.forEach((r: any) => {
       if (typeof r.traits === "string") r.traits = JSON.parse(r.traits || "{}");
       r.is_active = r.slug === activeSlug ? 1 : 0;
-      r.is_owner = parseInt(r.user_id) === parseInt(userId) ? 1 : 0;
-    }
+    });
     res.json(rows);
   } catch { res.status(500).json({ error: "Failed to fetch templates" }); }
 });
@@ -800,17 +853,11 @@ app.post("/api/agent-templates/clone/:templateId", authMiddleware, async (req, r
     const [templates]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE id = ?", [req.params.templateId]);
     if (templates.length === 0) return res.status(404).json({ error: "Template not found" });
     const src = templates[0];
-    // If it's a paid marketplace template, check purchase
-    if (parseFloat(src.price) > 0) {
-      const [purchases]: any = await db.execute("SELECT id FROM aba_marketplace_purchases WHERE buyer_user_id=? AND template_id=? AND status='completed'", [userId, req.params.templateId]);
-      if (purchases.length === 0 && parseInt(src.user_id) !== parseInt(userId)) {
-        return res.status(402).json({ error: "Purchase required", needs_purchase: true, price: src.price });
-      }
-    }
+    // Create a user-owned copy with a unique slug
     const slug = (src.name + '-' + userId + '-' + Date.now()).toLowerCase().replace(/[^a-z0-9-]/g, '-');
     const [result]: any = await db.execute(
-      `INSERT INTO aba_agent_templates (name, slug, gender, personality, role, description, instructions, welcome_message, is_global, user_id, avatar_url, mo_content, tk_content, oi_content, ra_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`,
-      [src.name + ' (clone)', slug, src.gender, src.personality, src.role, src.description, src.instructions, src.welcome_message || null, userId, src.avatar_url || null, src.mo_content || null, src.tk_content || null, src.oi_content || null, src.ra_content || null]
+      "INSERT INTO aba_agent_templates (name, slug, gender, personality, role, description, instructions, welcome_message, is_global, user_id, avatar_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+      [src.name + ' (clone)', slug, src.gender, src.personality, src.role, src.description, src.instructions, src.welcome_message || null, userId, src.avatar_url || null]
     );
     const [rows]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE id = ?", [result.insertId]);
     if (rows[0]?.traits && typeof rows[0].traits === "string") rows[0].traits = JSON.parse(rows[0].traits || "{}");
@@ -818,17 +865,15 @@ app.post("/api/agent-templates/clone/:templateId", authMiddleware, async (req, r
   } catch { res.status(500).json({ error: "Failed to clone template" }); }
 });
 
-// Full page role designer — create with MO/TK/OI/RA blocks
 app.post("/api/agent-templates", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const { name, gender, personality, role, description, instructions, welcome_message, avatar_url, mo_content, tk_content, oi_content, ra_content, traits } = req.body;
+    const { name, gender, personality, role, description, instructions, welcome_message } = req.body;
     if (!name) return res.status(400).json({ error: "Name is required" });
     const slug = name.toLowerCase().replace(/[^a-z0-9]/g, '-') + '-' + Date.now();
     const [result]: any = await db.execute(
-      `INSERT INTO aba_agent_templates (name, slug, gender, personality, role, description, instructions, welcome_message, is_global, user_id, avatar_url, mo_content, tk_content, oi_content, ra_content, traits)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`,
-      [name, slug, gender || 'neutral', personality || 'Friendly', role || 'General Assistant', description || null, instructions || null, welcome_message || null, userId, avatar_url || null, mo_content || null, tk_content || null, oi_content || null, ra_content || null, traits ? JSON.stringify(traits) : null]
+      "INSERT INTO aba_agent_templates (name, slug, gender, personality, role, description, instructions, welcome_message, is_global, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+      [name, slug, gender || 'neutral', personality || 'Friendly', role || 'General Assistant', description || null, instructions || null, welcome_message || null, userId]
     );
     const [rows]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE id = ?", [result.insertId]);
     if (rows[0]?.traits && typeof rows[0].traits === "string") rows[0].traits = JSON.parse(rows[0].traits || "{}");
@@ -836,25 +881,23 @@ app.post("/api/agent-templates", authMiddleware, async (req, res) => {
   } catch { res.status(500).json({ error: "Failed to create template" }); }
 });
 
-// Update template (with MO/TK/OI/RA)
 app.put("/api/agent-templates/:id", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const { name, gender, personality, role, description, instructions, welcome_message, avatar_url, mo_content, tk_content, oi_content, ra_content, traits } = req.body;
+    const { name, gender, personality, role, description, instructions, welcome_message } = req.body;
     const [existing]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE id = ?", [req.params.id]);
     if (!existing.length) return res.status(404).json({ error: "Template not found" });
     const t = existing[0];
-    if (parseInt(t.is_global)) return res.status(403).json({ error: "Cannot edit system templates" });
-    if (parseInt(t.user_id) !== parseInt(userId)) return res.status(403).json({ error: "Not your template" });
+    // Only allow editing own custom templates, not system global ones
+    if (parseInt(t.is_global)) {
+      return res.status(403).json({ error: "Cannot edit system templates" });
+    }
+    if (parseInt(t.user_id) !== parseInt(userId)) {
+      return res.status(403).json({ error: "Not your template" });
+    }
     await db.execute(
-      `UPDATE aba_agent_templates SET name=?, gender=?, personality=?, role=?, description=?, instructions=?, welcome_message=?, avatar_url=?, mo_content=?, tk_content=?, oi_content=?, ra_content=?, traits=? WHERE id=?`,
-      [name || t.name, gender || t.gender, personality || t.personality, role || t.role,
-       description !== undefined ? description : t.description, instructions !== undefined ? instructions : t.instructions,
-       welcome_message !== undefined ? welcome_message : t.welcome_message, avatar_url !== undefined ? avatar_url : t.avatar_url,
-       mo_content !== undefined ? mo_content : t.mo_content, tk_content !== undefined ? tk_content : t.tk_content,
-       oi_content !== undefined ? oi_content : t.oi_content, ra_content !== undefined ? ra_content : t.ra_content,
-       traits ? JSON.stringify(traits) : (typeof t.traits === 'string' ? t.traits : JSON.stringify(t.traits || {})),
-       req.params.id]
+      "UPDATE aba_agent_templates SET name=?, gender=?, personality=?, role=?, description=?, instructions=?, welcome_message=? WHERE id=?",
+      [name || t.name, gender || t.gender, personality || t.personality, role || t.role, description !== undefined ? description : t.description, instructions !== undefined ? instructions : t.instructions, welcome_message !== undefined ? welcome_message : t.welcome_message, req.params.id]
     );
     const [rows]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE id = ?", [req.params.id]);
     if (rows[0]?.traits && typeof rows[0].traits === "string") rows[0].traits = JSON.parse(rows[0].traits || "{}");
@@ -870,155 +913,9 @@ app.delete("/api/agent-templates/:id", authMiddleware, async (req, res) => {
     const t = existing[0];
     if (parseInt(t.is_global)) return res.status(403).json({ error: "Cannot delete system templates" });
     if (parseInt(t.user_id) !== parseInt(userId)) return res.status(403).json({ error: "Not your template" });
-    // If published, unpublish first
-    await db.execute("DELETE FROM aba_marketplace_purchases WHERE template_id=?", [req.params.id]);
     await db.execute("DELETE FROM aba_agent_templates WHERE id = ?", [req.params.id]);
     res.json({ success: true });
   } catch { res.status(500).json({ error: "Failed to delete template" }); }
-});
-
-// ==================== MARKETPLACE (public) ====================
-
-// Public listing — no auth
-app.get("/api/marketplace/roles", async (req, res) => {
-  try {
-    const [rows]: any = await db.execute(
-      `SELECT t.id, t.name, t.slug, t.gender, t.personality, t.role, t.description, t.welcome_message,
-              t.price, t.avatar_url, t.purchased_count, t.traits, t.created_at,
-              t.user_id, u.name AS author_name, u.email AS author_email
-       FROM aba_agent_templates t
-       LEFT JOIN aba_users u ON u.id = t.user_id
-       WHERE t.is_published = 1 AND t.is_system_admin = 0
-       ORDER BY t.purchased_count DESC, t.created_at DESC`
-    );
-    for (const r of rows) {
-      if (typeof r.traits === "string") r.traits = JSON.parse(r.traits || "{}");
-    }
-    res.json(rows);
-  } catch { res.status(500).json({ error: "Failed to fetch marketplace" }); }
-});
-
-// Publish/unpublish own template to marketplace
-app.put("/api/agent-templates/:id/publish", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const { price } = req.body;
-    const [existing]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE id=? AND user_id=?", [req.params.id, userId]);
-    if (!existing.length) return res.status(404).json({ error: "Template not found" });
-    const publishPrice = Math.max(0, parseFloat(price) || 0);
-    await db.execute("UPDATE aba_agent_templates SET is_published=1, price=? WHERE id=?", [publishPrice, req.params.id]);
-    res.json({ success: true, price: publishPrice });
-  } catch { res.status(500).json({ error: "Failed to publish" }); }
-});
-
-app.delete("/api/agent-templates/:id/publish", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const [existing]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE id=? AND user_id=?", [req.params.id, userId]);
-    if (!existing.length) return res.status(404).json({ error: "Template not found" });
-    await db.execute("UPDATE aba_agent_templates SET is_published=0, price=0 WHERE id=?", [req.params.id]);
-    res.json({ success: true });
-  } catch { res.status(500).json({ error: "Failed to unpublish" }); }
-});
-
-// Check if user has purchased a template
-app.get("/api/marketplace/purchased/:templateId", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const [rows]: any = await db.execute("SELECT id FROM aba_marketplace_purchases WHERE buyer_user_id=? AND template_id=? AND status='completed'", [userId, req.params.templateId]);
-    res.json({ purchased: rows.length > 0 });
-  } catch { res.json({ purchased: false }); }
-});
-
-// Purchase a marketplace role (uses Stripe)
-app.post("/api/marketplace/purchase/:templateId", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const [templates]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE id=? AND is_published=1", [req.params.templateId]);
-    if (!templates.length) return res.status(404).json({ error: "Role not found" });
-    const tmpl = templates[0];
-    // Check if already purchased
-    const [purchases]: any = await db.execute("SELECT id FROM aba_marketplace_purchases WHERE buyer_user_id=? AND template_id=? AND status='completed'", [userId, req.params.templateId]);
-    if (purchases.length > 0) {
-      // Already purchased — just clone
-      return res.json({ already_owned: true, template: tmpl });
-    }
-    if (parseFloat(tmpl.price) <= 0) {
-      // Free — skip payment, record purchase and clone
-      await db.execute("INSERT INTO aba_marketplace_purchases (buyer_user_id, template_id, price) VALUES (?, ?, 0)", [userId, req.params.templateId]);
-      await db.execute("UPDATE aba_agent_templates SET purchased_count = purchased_count + 1 WHERE id=?", [req.params.templateId]);
-      const slug = (tmpl.name + '-' + userId + '-' + Date.now()).toLowerCase().replace(/[^a-z0-9-]/g, '-');
-      await db.execute(
-        `INSERT INTO aba_agent_templates (name, slug, gender, personality, role, description, instructions, welcome_message, is_global, user_id, avatar_url, mo_content, tk_content, oi_content, ra_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`,
-        [tmpl.name, slug, tmpl.gender, tmpl.personality, tmpl.role, tmpl.description, tmpl.instructions, tmpl.welcome_message || null, userId, tmpl.avatar_url || null, tmpl.mo_content, tmpl.tk_content, tmpl.oi_content, tmpl.ra_content]
-      );
-      return res.json({ success: true, free: true });
-    }
-    // Paid — create Stripe checkout
-    const stripe = getStripe();
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      payment_intent_data: {
-        metadata: {
-          type: 'marketplace_role',
-          template_id: String(req.params.templateId),
-          buyer_user_id: String(userId),
-        },
-      },
-      line_items: [{
-        price_data: {
-          currency: 'usd',
-          product_data: { name: tmpl.name + ' (Agent Role Template)' },
-          unit_amount: Math.round(parseFloat(tmpl.price) * 100),
-        },
-        quantity: 1,
-      }],
-      success_url: `${process.env.FRONTEND_URL || 'https://dabarobjects.com'}/#/dashboard/roles?purchased=${tmpl.id}`,
-      cancel_url: `${process.env.FRONTEND_URL || 'https://dabarobjects.com'}/#/dashboard/roles?canceled=1`,
-    });
-    res.json({ url: session.url });
-  } catch (err: any) { res.status(500).json({ error: err.message }); }
-});
-
-// Stripe webhook handler for marketplace purchases
-app.post("/api/stripe-marketplace-webhook", express.raw({ type: 'application/json' }), async (req: any, res: any) => {
-  try {
-    const sig = req.headers['stripe-signature'];
-    const stripe = getStripe();
-    const event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET || '');
-    if (event.type === 'checkout.session.completed') {
-      const session = event.data.object;
-      const metadata = session.metadata || {};
-      if (metadata.type === 'marketplace_role') {
-        const templateId = parseInt(metadata.template_id);
-        const buyerUserId = parseInt(metadata.buyer_user_id);
-        const amountPaid = (session.amount_total || 0) / 100;
-        if (templateId && buyerUserId) {
-          // Record purchase
-          await db.execute(
-            "INSERT INTO aba_marketplace_purchases (buyer_user_id, template_id, price, stripe_payment_id, status) VALUES (?, ?, ?, ?, 'completed')",
-            [buyerUserId, templateId, amountPaid, session.id]
-          );
-          // Increment purchased count
-          await db.execute("UPDATE aba_agent_templates SET purchased_count = purchased_count + 1 WHERE id=?", [templateId]);
-          // Clone template for buyer
-          const [tmpl]: any = await db.execute("SELECT * FROM aba_agent_templates WHERE id=?", [templateId]);
-          if (tmpl.length) {
-            const t = tmpl[0];
-            const slug = (t.name + '-' + buyerUserId + '-' + Date.now()).toLowerCase().replace(/[^a-z0-9-]/g, '-');
-            await db.execute(
-              `INSERT INTO aba_agent_templates (name, slug, gender, personality, role, description, instructions, welcome_message, is_global, user_id, avatar_url, mo_content, tk_content, oi_content, ra_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`,
-              [t.name, slug, t.gender, t.personality, t.role, t.description, t.instructions, t.welcome_message || null, buyerUserId, t.avatar_url || null, t.mo_content, t.tk_content, t.oi_content, t.ra_content]
-            );
-          }
-        }
-      }
-    }
-    res.json({ received: true });
-  } catch (err: any) {
-    console.error("Marketplace webhook error:", err);
-    res.status(400).send(`Webhook Error: ${err.message}`);
-  }
 });
 
 // ==================== API KEYS ====================
@@ -1209,479 +1106,69 @@ app.delete("/api/associates/:id", authMiddleware, async (req, res) => {
   } catch { res.status(500).json({ error: "Failed to delete associate" }); }
 });
 
-
-// ───── Bank Name Lookup (by country) ─────
-const BANK_DATA: Record<string, {name: string}[]> = {
-  NG: [
-    { name: 'Access Bank' }, { name: 'Citibank Nigeria' }, { name: 'Ecobank Nigeria' },
-    { name: 'Fidelity Bank' }, { name: 'First Bank of Nigeria' }, { name: 'First City Monument Bank (FCMB)' },
-    { name: 'Globus Bank' }, { name: 'GTBank (Guaranty Trust Bank)' }, { name: 'Heritage Bank' },
-    { name: 'Jaiz Bank' }, { name: 'Keystone Bank' }, { name: 'Kuda Bank' },
-    { name: 'Moniepoint' }, { name: 'OPay' }, { name: 'PalmPay' },
-    { name: 'Polaris Bank' }, { name: 'Providus Bank' }, { name: 'Stanbic IBTC Bank' },
-    { name: 'Standard Chartered' }, { name: 'Sterling Bank' }, { name: 'Suntrust Bank' },
-    { name: 'Titan Trust Bank' }, { name: 'Union Bank' }, { name: 'United Bank for Africa (UBA)' },
-    { name: 'Unity Bank' }, { name: 'Wema Bank' }, { name: 'Zenith Bank' },
-  ],
-  GH: [{ name: 'Access Bank Ghana' }, { name: 'Ecobank Ghana' }, { name: 'Fidelity Bank Ghana' }, { name: 'GCB Bank' }, { name: 'Stanbic Bank Ghana' }, { name: 'Zenith Bank Ghana' }, { name: 'Absa Bank Ghana' }, { name: 'CalBank' }, { name: 'First National Bank' }, { name: 'Prudential Bank' }],
-  KE: [{ name: 'Equity Bank' }, { name: 'KCB Bank' }, { name: 'Co-operative Bank' }, { name: 'Absa Bank Kenya' }, { name: 'NCBA Bank' }, { name: 'Diamond Trust Bank' }, { name: 'Standard Chartered Kenya' }, { name: 'Stanbic Bank Kenya' }, { name: 'Bank of Africa Kenya' }, { name: 'Family Bank' }, { name: 'I&M Bank' }],
-  ZA: [{ name: 'Absa' }, { name: 'First National Bank (FNB)' }, { name: 'Nedbank' }, { name: 'Standard Bank' }, { name: 'Capitec Bank' }, { name: 'African Bank' }, { name: 'Investec' }],
-  US: [{ name: 'JPMorgan Chase' }, { name: 'Bank of America' }, { name: 'Wells Fargo' }, { name: 'Citibank' }, { name: 'U.S. Bank' }, { name: 'PNC Bank' }, { name: 'TD Bank' }, { name: 'Capital One' }, { name: 'HSBC USA' }, { name: 'Charles Schwab Bank' }],
-  GB: [{ name: 'Barclays' }, { name: 'HSBC UK' }, { name: 'Lloyds Bank' }, { name: 'NatWest' }, { name: 'Santander UK' }, { name: 'TSB Bank' }, { name: 'Nationwide' }, { name: 'Virgin Money' }, { name: 'Starling Bank' }, { name: 'Monzo' }, { name: 'Revolut' }],
-  CA: [{ name: 'RBC' }, { name: 'TD Canada Trust' }, { name: 'Scotiabank' }, { name: 'BMO' }, { name: 'CIBC' }, { name: 'National Bank of Canada' }, { name: 'HSBC Canada' }],
-  AU: [{ name: 'Commonwealth Bank' }, { name: 'Westpac' }, { name: 'ANZ' }, { name: 'NAB' }, { name: 'Macquarie Bank' }, { name: 'Suncorp' }, { name: 'Bank of Queensland' }],
-  DE: [{ name: 'Deutsche Bank' }, { name: 'Commerzbank' }, { name: 'N26' }, { name: 'Sparkasse' }, { name: 'DKB (Deutsche Kreditbank)' }, { name: 'Postbank' }, { name: 'Volksbank' }],
-  FR: [{ name: 'BNP Paribas' }, { name: 'Societe Generale' }, { name: 'Credit Agricole' }, { name: 'CIC' }, { name: 'Banque Populaire' }, { name: 'La Banque Postale' }, { name: 'Revolut France' }],
-  NL: [{ name: 'ING' }, { name: 'ABN AMRO' }, { name: 'Rabobank' }, { name: 'Triodos Bank' }, { name: 'Bunq' }, { name: 'SNS Bank' }],
-  AE: [{ name: 'Emirates NBD' }, { name: 'Abu Dhabi Commercial Bank (ADCB)' }, { name: 'Mashreq Bank' }, { name: 'First Abu Dhabi Bank (FAB)' }, { name: 'Dubai Islamic Bank' }, { name: 'Rakbank' }],
-};
-
-app.get("/api/bank-lookup", authMiddleware, async (req, res) => {
-  try {
-    const country = String(req.query.country || '').toUpperCase();
-    if (!country) return res.json([]);
-    const banks = BANK_DATA[country] || [];
-    res.json(banks);
-  } catch { res.status(500).json({ error: "Bank lookup failed" }); }
-});
-
-// ───── Bank CRUD ─────
-app.get("/api/bank-accounts", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const [rows]: any = await db.execute("SELECT * FROM aba_bank_accounts WHERE user_id = ? ORDER BY is_primary DESC, created_at ASC", [userId]);
-    res.json(rows);
-  } catch { res.status(500).json({ error: "Failed to fetch bank accounts" }); }
-});
-
-app.post("/api/bank-accounts", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const { country, bank_name, account_number, routing_number, account_name, is_primary, currency } = req.body;
-    if (!country || !bank_name || !account_number || !account_name) return res.status(400).json({ error: "Country, bank name, account number, and account name are required" });
-    const setPrimary = is_primary === true || is_primary === 1;
-    if (setPrimary) await db.execute("UPDATE aba_bank_accounts SET is_primary=0 WHERE user_id=?", [userId]);
-    const result: any = await db.execute(
-      "INSERT INTO aba_bank_accounts (user_id, country, bank_name, account_number, routing_number, account_name, is_primary, currency) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      [userId, country, bank_name, account_number, routing_number || null, account_name, setPrimary ? 1 : 0, currency || 'USD']
-    );
-    const [rows]: any = await db.execute("SELECT * FROM aba_bank_accounts WHERE id = ?", [(result as any)[0]?.insertId || 0]);
-    res.json(rows[0] || null);
-  } catch(e: any) { res.status(500).json({ error: "Failed to create bank account: " + e.message }); }
-});
-
-app.put("/api/bank-accounts/:id", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const { country, bank_name, account_number, routing_number, account_name, is_primary, currency } = req.body;
-    const setPrimary = is_primary === true || is_primary === 1;
-    if (setPrimary) await db.execute("UPDATE aba_bank_accounts SET is_primary=0 WHERE user_id=?", [userId]);
-    await db.execute(
-      "UPDATE aba_bank_accounts SET country=?, bank_name=?, account_number=?, routing_number=?, account_name=?, is_primary=?, currency=? WHERE id=? AND user_id=?",
-      [country, bank_name, account_number, routing_number || null, account_name, setPrimary ? 1 : 0, currency || 'USD', req.params.id, userId]
-    );
-    const [rows]: any = await db.execute("SELECT * FROM aba_bank_accounts WHERE id = ?", [req.params.id]);
-    res.json(rows[0]);
-  } catch(e: any) { res.status(500).json({ error: "Failed to update bank account: " + e.message }); }
-});
-
-app.delete("/api/bank-accounts/:id", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    await db.execute("DELETE FROM aba_bank_accounts WHERE id=? AND user_id=?", [req.params.id, userId]);
-    res.json({ success: true });
-  } catch(e: any) { res.status(500).json({ error: "Failed to delete bank account: " + e.message }); }
-});
-
-// ==================== CUSTOM DATABASES ====================
-
-app.get("/api/custom-databases", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const [rows]: any = await db.execute("SELECT * FROM aba_custom_databases WHERE user_id = ? ORDER BY is_primary DESC, created_at ASC", [userId]);
-    res.json(rows);
-  } catch(e: any) { res.status(500).json({ error: "Failed to fetch custom databases: " + e.message }); }
-});
-
-app.post("/api/custom-databases", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const { name, db_type, db_host, db_port, db_name, db_user, db_pass, connection_string, is_primary } = req.body;
-    const setPrimary = is_primary === true || is_primary === 1;
-    if (setPrimary) await db.execute("UPDATE aba_custom_databases SET is_primary=0 WHERE user_id=?", [userId]);
-    const result: any = await db.execute(
-      "INSERT INTO aba_custom_databases (user_id, name, db_type, db_host, db_port, db_name, db_user, db_pass, connection_string, is_primary) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      [userId, name || '', db_type || 'mysql', db_host || '', db_port || 3306, db_name || '', db_user || '', db_pass || '', connection_string || '', setPrimary ? 1 : 0]
-    );
-    const [rows]: any = await db.execute("SELECT * FROM aba_custom_databases WHERE id = ?", [(result as any)[0]?.insertId || 0]);
-    res.json(rows[0] || null);
-  } catch(e: any) { res.status(500).json({ error: "Failed to create custom database: " + e.message }); }
-});
-
-app.put("/api/custom-databases/:id", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const { name, db_type, db_host, db_port, db_name, db_user, db_pass, connection_string, is_primary } = req.body;
-    const setPrimary = is_primary === true || is_primary === 1;
-    if (setPrimary) await db.execute("UPDATE aba_custom_databases SET is_primary=0 WHERE user_id=?", [userId]);
-    await db.execute(
-      "UPDATE aba_custom_databases SET name=?, db_type=?, db_host=?, db_port=?, db_name=?, db_user=?, db_pass=?, connection_string=?, is_primary=? WHERE id=? AND user_id=?",
-      [name || '', db_type || 'mysql', db_host || '', db_port || 3306, db_name || '', db_user || '', db_pass || '', connection_string || '', setPrimary ? 1 : 0, req.params.id, userId]
-    );
-    const [rows]: any = await db.execute("SELECT * FROM aba_custom_databases WHERE id = ?", [req.params.id]);
-    res.json(rows[0]);
-  } catch(e: any) { res.status(500).json({ error: "Failed to update custom database: " + e.message }); }
-});
-
-app.delete("/api/custom-databases/:id", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    await db.execute("DELETE FROM aba_custom_databases WHERE id=? AND user_id=?", [req.params.id, userId]);
-    res.json({ success: true });
-  } catch(e: any) { res.status(500).json({ error: "Failed to delete custom database: " + e.message }); }
-});
-
-// ==================== EMAIL SOURCES ====================
-
-app.get("/api/email-sources", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const [rows]: any = await db.execute("SELECT * FROM aba_email_sources WHERE user_id = ? ORDER BY is_primary DESC, created_at ASC", [userId]);
-    res.json(rows);
-  } catch(e: any) { res.status(500).json({ error: "Failed to fetch email sources: " + e.message }); }
-});
-
-app.post("/api/email-sources", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const { name, email_address, pop_host, pop_port, pop_user, pop_pass, instruction, is_primary, enabled } = req.body;
-    const setPrimary = is_primary === true || is_primary === 1;
-    if (setPrimary) await db.execute("UPDATE aba_email_sources SET is_primary=0 WHERE user_id=?", [userId]);
-    const result: any = await db.execute(
-      "INSERT INTO aba_email_sources (user_id, name, email_address, pop_host, pop_port, pop_user, pop_pass, instruction, is_primary, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      [userId, name || '', email_address || '', pop_host || '', pop_port || 993, pop_user || '', pop_pass || '', instruction || '', setPrimary ? 1 : 0, enabled !== false ? 1 : 0]
-    );
-    const [rows]: any = await db.execute("SELECT * FROM aba_email_sources WHERE id = ?", [(result as any)[0]?.insertId || 0]);
-    res.json(rows[0] || null);
-  } catch(e: any) { res.status(500).json({ error: "Failed to create email source: " + e.message }); }
-});
-
-app.put("/api/email-sources/:id", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const { name, email_address, pop_host, pop_port, pop_user, pop_pass, instruction, is_primary, enabled } = req.body;
-    const setPrimary = is_primary === true || is_primary === 1;
-    if (setPrimary) await db.execute("UPDATE aba_email_sources SET is_primary=0 WHERE user_id=?", [userId]);
-    await db.execute(
-      "UPDATE aba_email_sources SET name=?, email_address=?, pop_host=?, pop_port=?, pop_user=?, pop_pass=?, instruction=?, is_primary=?, enabled=? WHERE id=? AND user_id=?",
-      [name || '', email_address || '', pop_host || '', pop_port || 993, pop_user || '', pop_pass || '', instruction || '', setPrimary ? 1 : 0, enabled !== false ? 1 : 0, req.params.id, userId]
-    );
-    const [rows]: any = await db.execute("SELECT * FROM aba_email_sources WHERE id = ?", [req.params.id]);
-    res.json(rows[0]);
-  } catch(e: any) { res.status(500).json({ error: "Failed to update email source: " + e.message }); }
-});
-
-app.delete("/api/email-sources/:id", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    await db.execute("DELETE FROM aba_email_sources WHERE id=? AND user_id=?", [req.params.id, userId]);
-    res.json({ success: true });
-  } catch(e: any) { res.status(500).json({ error: "Failed to delete email source: " + e.message }); }
-});
-
-// ==================== ECOMMERCE STORES ====================
-
-app.get("/api/ecommerce-stores", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const [rows]: any = await db.execute("SELECT * FROM aba_ecommerce_stores WHERE user_id = ? ORDER BY is_primary DESC, created_at ASC", [userId]);
-    res.json(rows);
-  } catch(e: any) { res.status(500).json({ error: "Failed to fetch ecommerce stores: " + e.message }); }
-});
-
-app.post("/api/ecommerce-stores", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const { name, store_type, url, api_key, api_secret, access_token, is_primary } = req.body;
-    const setPrimary = is_primary === true || is_primary === 1;
-    if (setPrimary) await db.execute("UPDATE aba_ecommerce_stores SET is_primary=0 WHERE user_id=?", [userId]);
-    const result: any = await db.execute(
-      "INSERT INTO aba_ecommerce_stores (user_id, name, store_type, url, api_key, api_secret, access_token, is_primary) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      [userId, name || '', store_type || 'woocommerce', url || '', api_key || '', api_secret || '', access_token || '', setPrimary ? 1 : 0]
-    );
-    const [rows]: any = await db.execute("SELECT * FROM aba_ecommerce_stores WHERE id = ?", [(result as any)[0]?.insertId || 0]);
-    res.json(rows[0] || null);
-  } catch(e: any) { res.status(500).json({ error: "Failed to create ecommerce store: " + e.message }); }
-});
-
-app.put("/api/ecommerce-stores/:id", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const { name, store_type, url, api_key, api_secret, access_token, is_primary } = req.body;
-    const setPrimary = is_primary === true || is_primary === 1;
-    if (setPrimary) await db.execute("UPDATE aba_ecommerce_stores SET is_primary=0 WHERE user_id=?", [userId]);
-    await db.execute(
-      "UPDATE aba_ecommerce_stores SET name=?, store_type=?, url=?, api_key=?, api_secret=?, access_token=?, is_primary=? WHERE id=? AND user_id=?",
-      [name || '', store_type || 'woocommerce', url || '', api_key || '', api_secret || '', access_token || '', setPrimary ? 1 : 0, req.params.id, userId]
-    );
-    const [rows]: any = await db.execute("SELECT * FROM aba_ecommerce_stores WHERE id = ?", [req.params.id]);
-    res.json(rows[0]);
-  } catch(e: any) { res.status(500).json({ error: "Failed to update ecommerce store: " + e.message }); }
-});
-
-app.delete("/api/ecommerce-stores/:id", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    await db.execute("DELETE FROM aba_ecommerce_stores WHERE id=? AND user_id=?", [req.params.id, userId]);
-    res.json({ success: true });
-  } catch(e: any) { res.status(500).json({ error: "Failed to delete ecommerce store: " + e.message }); }
-});
-
-// ==================== GOOGLE CALENDAR OAUTH ====================
-
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_OAUTH_CLIENT_ID || "";
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_OAUTH_CLIENT_SECRET || "";
-const GOOGLE_REDIRECT_URI = process.env.GOOGLE_OAUTH_REDIRECT_URI || "https://dabarobjects.com/api/oauth/google/callback";
-const GOOGLE_SCOPES = [
-  "https://www.googleapis.com/auth/calendar",
-  "https://www.googleapis.com/auth/userinfo.email",
-  "openid",
-];
-
-function getOAuth2Client(): OAuth2Client {
-  return new OAuth2Client(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI);
-}
-
-function encryptToken(text: string): string {
-  const cipher = crypto.createCipheriv(
-    "aes-256-cbc",
-    Buffer.from(JWT_SECRET.padEnd(32, "0").slice(0, 32)),
-    Buffer.from(JWT_SECRET.padEnd(16, "0").slice(0, 16))
-  );
-  let enc = cipher.update(text, "utf8", "hex");
-  enc += cipher.final("hex");
-  return enc;
-}
-
-function decryptToken(enc: string): string {
-  const decipher = crypto.createDecipheriv(
-    "aes-256-cbc",
-    Buffer.from(JWT_SECRET.padEnd(32, "0").slice(0, 32)),
-    Buffer.from(JWT_SECRET.padEnd(16, "0").slice(0, 16))
-  );
-  let dec = decipher.update(enc, "hex", "utf8");
-  dec += decipher.final("utf8");
-  return dec;
-}
-
-// Google OAuth callback (Google redirects here with ?code=&state=)
-app.get("/api/oauth/google/callback", async (req, res) => {
-  try {
-    const { code, state, error: oauthError } = req.query;
-    if (oauthError) throw new Error("Google returned: " + oauthError);
-    if (!code) throw new Error("No authorization code received");
-
-    const userId = parseInt(String(state || "0"), 10);
-    if (!userId) {
-      return res.redirect("https://dabarobjects.com/#/dashboard/tools/google-calendar?error=invalid_state");
-    }
-
-    const oauth = getOAuth2Client();
-    const { tokens } = await oauth.getToken(String(code));
-
-    // Get userinfo email
-    let googleEmail = "";
-    if (tokens.id_token) {
-      const ticket = await oauth.verifyIdToken({ idToken: tokens.id_token });
-      const payload = ticket.getPayload();
-      googleEmail = payload?.email || "";
-    }
-
-    const encryptedRefresh = encryptToken(tokens.refresh_token || "");
-    const encryptedAccess = encryptToken(tokens.access_token || "");
-
-    // Upsert
-    const [existing]: any = await db.execute("SELECT id FROM aba_google_tokens WHERE user_id = ?", [userId]);
-    if (existing.length > 0) {
-      await db.execute(
-        "UPDATE aba_google_tokens SET google_email=?, refresh_token=?, access_token=?, token_expiry=?, scopes=? WHERE user_id=?",
-        [googleEmail, encryptedRefresh, encryptedAccess, tokens.expiry_date ? new Date(tokens.expiry_date) : null, GOOGLE_SCOPES.join(" "), userId]
-      );
-    } else {
-      await db.execute(
-        "INSERT INTO aba_google_tokens (user_id, google_email, refresh_token, access_token, token_expiry, scopes) VALUES (?, ?, ?, ?, ?, ?)",
-        [userId, googleEmail, encryptedRefresh, encryptedAccess, tokens.expiry_date ? new Date(tokens.expiry_date) : null, GOOGLE_SCOPES.join(" ")]
-      );
-    }
-
-    res.redirect("https://dabarobjects.com/#/dashboard/tools/google-calendar?linked=true");
-  } catch(e: any) {
-    console.error("Google OAuth callback error:", e.message);
-    res.redirect("https://dabarobjects.com/#/dashboard/tools/google-calendar?error=" + encodeURIComponent(e.message));
-  }
-});
-
-// Get Google OAuth status
-app.get("/api/oauth/google/status", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const [rows]: any = await db.execute(
-      "SELECT id, google_email, token_expiry, scopes, created_at, updated_at FROM aba_google_tokens WHERE user_id = ?",
-      [userId]
-    );
-
-    if (rows.length === 0) {
-      return res.json({ linked: false });
-    }
-
-    const row = rows[0];
-    const now = new Date();
-    const expiry = row.token_expiry ? new Date(row.token_expiry) : null;
-    const active = expiry ? expiry > now : false;
-
-    res.json({
-      linked: true,
-      active,
-      google_email: row.google_email,
-      scopes: row.scopes,
-      created_at: row.created_at,
-      updated_at: row.updated_at,
-    });
-  } catch(e: any) {
-    res.status(500).json({ error: "Failed to check Google status: " + e.message });
-  }
-});
-
-// Get OAuth URL for frontend redirect
-app.get("/api/oauth/google/url", authMiddleware, async (req, res) => {
-  try {
-    const oauth = getOAuth2Client();
-    const url = oauth.generateAuthUrl({
-      access_type: "offline",
-      prompt: "consent",
-      scope: GOOGLE_SCOPES,
-      state: String((req as any).user.userId || ""),
-    });
-    res.json({ url });
-  } catch(e: any) {
-    res.status(500).json({ error: "Failed to generate auth URL: " + e.message });
-  }
-});
-
-// Refresh an expired access token
-async function refreshGoogleToken(userId: number): Promise<string | null> {
-  try {
-    const [rows]: any = await db.execute("SELECT refresh_token, google_email FROM aba_google_tokens WHERE user_id = ?", [userId]);
-    if (rows.length === 0) return null;
-
-    const decrypted = decryptToken(rows[0].refresh_token);
-    if (!decrypted) return null;
-
-    const oauth = getOAuth2Client();
-    oauth.setCredentials({ refresh_token: decrypted });
-
-    const { credentials } = await oauth.refreshAccessToken();
-    const encrypted = encryptToken(credentials.access_token || "");
-
-    await db.execute(
-      "UPDATE aba_google_tokens SET access_token=?, token_expiry=? WHERE user_id=?",
-      [encrypted, credentials.expiry_date ? new Date(credentials.expiry_date) : null, userId]
-    );
-
-    return credentials.access_token || null;
-  } catch(e: any) {
-    console.error("Token refresh failed for user", userId, ":", e.message);
-    return null;
-  }
-}
-
-// Sync token to EC2 instance
-app.post("/api/oauth/google/sync", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-
-    // Get user info + google token
-    const [userRows]: any = await db.execute("SELECT email FROM aba_users WHERE id = ?", [userId]);
-    if (userRows.length === 0) return res.status(404).json({ error: "User not found" });
-
-    const [tokenRows]: any = await db.execute("SELECT * FROM aba_google_tokens WHERE user_id = ?", [userId]);
-    if (tokenRows.length === 0) return res.status(400).json({ error: "No Google account linked" });
-
-    const token = tokenRows[0];
-
-    // Refresh the access token if expired
-    let accessToken = token.access_token;
-    const now = new Date();
-    if (token.token_expiry && new Date(token.token_expiry) <= now) {
-      accessToken = await refreshGoogleToken(userId);
-      if (!accessToken) return res.status(400).json({ error: "Token expired and refresh failed. Please re-link." });
-    }
-
-    // Decrypt tokens for sync
-    const decryptedRefresh = decryptToken(token.refresh_token);
-    const decryptedAccess = accessToken ? decryptToken(accessToken) : "";
-
-    // Store on EC2 via the agent's API endpoint
-    const userEmail = userRows[0].email;
-    const ec2Host = process.env.AGENT_EC2_HOST || "";
-    const ec2Token = process.env.EC2_SYNC_TOKEN || "";
-
-    if (ec2Host && ec2Token) {
-      const body = JSON.stringify({
-        user_id: userId,
-        email: userEmail,
-        google_email: token.google_email,
-        refresh_token: decryptedRefresh,
-        access_token: decryptedAccess,
-        scopes: token.scopes,
-      });
-
-      const ab = new AbortController();
-      const timer = setTimeout(() => ab.abort(), 10000);
-
-      const upstream = await fetch(`${ec2Host}/api/google/sync-token`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${ec2Token}` },
-        body,
-        signal: ab.signal,
-      });
-      clearTimeout(timer);
-
-      if (!upstream.ok) {
-        const errText = await upstream.text();
-        console.error("EC2 sync failed:", upstream.status, errText);
-        return res.status(502).json({ error: "EC2 sync failed", detail: errText });
-      }
-    }
-
-    res.json({ success: true, message: "Token synced to EC2" });
-  } catch(e: any) {
-    console.error("Sync error:", e.message);
-    res.status(500).json({ error: "Sync failed: " + e.message });
-  }
-});
-
-// Unlink (delete) Google OAuth token
-app.delete("/api/oauth/google", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    await db.execute("DELETE FROM aba_google_tokens WHERE user_id = ?", [userId]);
-    res.json({ success: true });
-  } catch(e: any) {
-    res.status(500).json({ error: "Failed to unlink: " + e.message });
-  }
-});
-
 // ==================== SUBSCRIPTIONS ====================
 
 app.get("/api/subscription", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
     const [rows]: any = await db.execute(
-      "SELECT plan, status, stripe_subscription_id, current_period_start, current_period_end FROM aba_subscriptions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1", [userId]
+      "SELECT plan, status, stripe_subscription_id, created_at, current_period_start, current_period_end FROM aba_subscriptions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1", [userId]
     );
-    res.json(rows.length > 0 ? rows[0] : { plan: null, status: "none" });
+    const sub = rows.length > 0 ? rows[0] : null;
+
+    // Count current agents
+    const [agentRows]: any = await db.execute(
+      "SELECT COUNT(*) as cnt FROM aba_team_agents WHERE user_id=?", [userId]
+    );
+    const agentCount = agentRows[0]?.cnt || 0;
+
+    const planKey = sub?.plan || 'trial';
+    const planConfig = PLANS[planKey] || PLANS.trial;
+
+    // Trial expiry
+    let trialDaysRemaining = 0;
+    if (planKey === 'trial' && sub?.created_at) {
+      const trialEnd = new Date(sub.created_at);
+      trialEnd.setDate(trialEnd.getDate() + 14);
+      trialDaysRemaining = Math.max(0, Math.ceil((trialEnd.getTime() - Date.now()) / 86400000));
+    }
+
+    res.json({
+      plan: sub?.plan || null,
+      status: sub?.status || 'none',
+      stripe_subscription_id: sub?.stripe_subscription_id || null,
+      current_period_start: sub?.current_period_start || null,
+      current_period_end: sub?.current_period_end || null,
+      trialDaysRemaining,
+      // Plan metadata
+      planLabel: planConfig.label,
+      maxAgents: planConfig.maxAgents,
+      agentCount,
+      server: planConfig.serverLabel,
+      features: planConfig.features,
+      support: planConfig.support,
+      price: planConfig.price,
+      // Upgrade option detection
+      canUpgrade: planKey === 'trial' || planKey === 'solo' || planKey === 'pro',
+      availablePlans: [
+        { slug: 'solo', label: PLANS.solo.label, price: PLANS.solo.price, maxAgents: PLANS.solo.maxAgents, server: PLANS.solo.serverLabel, features: PLANS.solo.features },
+        { slug: 'pro', label: PLANS.pro.label, price: PLANS.pro.price, maxAgents: PLANS.pro.maxAgents, server: PLANS.pro.serverLabel, features: PLANS.pro.features },
+        { slug: 'enterprise', label: PLANS.enterprise.label, price: PLANS.enterprise.price, maxAgents: PLANS.enterprise.maxAgents, server: PLANS.enterprise.serverLabel, features: PLANS.enterprise.features },
+      ],
+    });
   } catch { res.status(500).json({ error: "Failed to fetch subscription" }); }
+});
+
+// Backward-compat endpoint for AgentHub (legacy format)
+app.get("/api/subscription/current", authMiddleware, async (req: any, res: any) => {
+  try {
+    const { userId } = req.user;
+    const [rows]: any = await db.execute(
+      "SELECT plan FROM aba_subscriptions WHERE user_id=? AND status='active' ORDER BY created_at DESC LIMIT 1", [userId]
+    );
+    const plan = rows.length > 0 ? rows[0].plan : 'trial';
+    res.json({ plan_name: plan });
+  } catch { res.json({ plan_name: 'trial' }); }
 });
 
 app.post("/api/subscription/activate-trial", authMiddleware, async (req, res) => {
@@ -1752,7 +1239,12 @@ app.get("/api/deploy", authMiddleware, async (req, res) => {
     const [rows]: any = await db.execute("SELECT * FROM aba_deployments WHERE user_id = ?", [userId]);
     if (rows.length === 0) return res.json({ status: null });
     const d = rows[0];
-    res.json({ id: d.id, status: d.status, instanceId: d.instance_id, publicIp: d.public_ip,
+    // Look up plan so we can return branded server name (no AWS types leaked)
+    const [subRows]: any = await db.execute(
+      "SELECT plan FROM aba_subscriptions WHERE user_id=? AND status='active' ORDER BY created_at DESC LIMIT 1", [userId]
+    );
+    const planKey = subRows.length > 0 ? subRows[0].plan : 'trial';
+    res.json({ id: d.id, status: d.status, instanceId: d.instance_id, publicIp: d.public_ip, server: planServerLabel(planKey),
       telegramUsername: d.telegram_bot_username, errorMessage: d.error_message, bindCode: d.bind_code,
       ownerChatId: d.owner_chat_id, ownerName: d.owner_name, deployedAt: d.deployed_at, decommissionedAt: d.decommissioned_at,
       createdAt: d.created_at });
@@ -1777,6 +1269,10 @@ app.post("/api/deploy", authMiddleware, async (req, res) => {
     const sub = subRows.length > 0 ? subRows[0] : null;
     if (!sub || sub.status !== 'active') return res.status(400).json({ error: "Active subscription required to deploy" });
 
+    // Determine instance type from plan
+    const planKey = sub.plan === 'trial' ? 'trial' : (PLANS[sub.plan] ? sub.plan : 'solo');
+    const instanceType = planInstanceType(planKey);
+
     let [keyRows]: any = await db.execute("SELECT * FROM aba_api_keys WHERE user_id=? AND is_active=1", [userId]);
     if (keyRows.length === 0) {
       const defaultKey = process.env.DEFAULT_DEEPSEEK_KEY;
@@ -1794,12 +1290,12 @@ app.post("/api/deploy", authMiddleware, async (req, res) => {
     const bindCode = Math.random().toString(36).substring(2, 8).toUpperCase();
 
     if (existing.length > 0) {
-      await db.execute("UPDATE aba_deployments SET status='pending', error_message=NULL, deployed_at=NULL, decommissioned_at=NULL, bind_code=?, owner_chat_id=NULL WHERE user_id=?", [bindCode, userId]);
+      await db.execute("UPDATE aba_deployments SET status='pending', instance_type=?, error_message=NULL, deployed_at=NULL, decommissioned_at=NULL, bind_code=?, owner_chat_id=NULL WHERE user_id=?", [instanceType, bindCode, userId]);
     } else {
-      await db.execute("INSERT INTO aba_deployments (user_id, status, bind_code, updated_at) VALUES (?, 'pending', ?, NOW())", [userId, bindCode]);
+      await db.execute("INSERT INTO aba_deployments (user_id, status, instance_type, bind_code, updated_at) VALUES (?, 'pending', ?, ?, NOW())", [userId, instanceType, bindCode]);
     }
 
-    res.json({ success: true, message: "Deployment queued.", userEmail: user.email, bindCode });
+    res.json({ success: true, message: "Deployment queued.", userEmail: user.email, bindCode, instanceType });
   } catch (err: any) {
     console.error("Deploy error:", err);
     res.status(500).json({ error: "Failed to queue deployment" });
@@ -1869,10 +1365,10 @@ app.get("/api/openclaw-config", authMiddleware, async (req, res) => {
     const [subRows]: any = await db.execute("SELECT * FROM aba_subscriptions WHERE user_id=? ORDER BY created_at DESC LIMIT 1", [userId]);
     const subscription = subRows.length > 0 ? subRows[0] : null;
 
-    // Generate MO (Method of Operations)
+    // Generate SOUL.md
     const personality = agent.personality || "Professional";
     const bizName = business.business_name || "My Business";
-    const moContent = `# ${agent.agent_name || "My ABA Agent"} — Method of Operations
+    const soulMd = `# ${agent.agent_name || "My ABA Agent"} — SOUL.md
 
 ## Identity
 I am an AI business assistant named **${agent.agent_name || "Assistant"}**, serving **${bizName}**.
@@ -1895,23 +1391,14 @@ ${personality === "Friendly" ? "Warm, approachable, and conversational. I make c
   personality === "Efficient" ? "Direct, concise, and action-oriented. I value the customer's time." :
   "Professional, courteous, and clear. I maintain high standards of business communication."}`;
 
-    // Products TK (Technical Knowledge — resolved to presigned URLs)
-    const productLines = await Promise.all(products.map(async (p: any) => {
-      let line = `- **${p.name}**${p.price ? ` (${p.price})` : ''}${p.description ? `: ${p.description}` : ''}`;
-      if (p.image_s3_key) {
-        const presigned = await getPresignedUrl(p.image_s3_key, 86400);
-        if (presigned) line += `\n  - Image: ${presigned}`;
-      } else if (p.image) {
-        line += `\n  - Image: ${p.image}`;
-      }
-      return line;
-    })).then(lines => lines.join('\n'));
-    const tkContent = products.length > 0
+    // Products knowledge
+    const productLines = products.map((p: any) => `- **${p.name}**${p.price ? ` (${p.price})` : ''}${p.description ? `: ${p.description}` : ''}`).join('\n');
+    const knowledgeMd = products.length > 0
       ? `## Products & Services\n\n${productLines}\n`
       : '';
 
-    // Generate OI (Operating Identity)
-    const oiContent = `# Operating Identity: ${agent.agent_name || "Assistant"}
+    // Generate persona.md
+    const personaMd = `# Persona: ${agent.agent_name || "Assistant"}
 - **Name:** ${agent.agent_name || "Assistant"}
 - **Personality:** ${personality}
 - **Role:** AI Business Assistant for ${bizName}\n`;
@@ -1926,17 +1413,14 @@ ${personality === "Friendly" ? "Warm, approachable, and conversational. I make c
     };
     if (agent.whatsapp_number) openclawConfig.channels = { ...openclawConfig.channels, whatsapp: { number: agent.whatsapp_number } };
 
-    // RA (Routine Activities) — placeholder for future heartbeat/routine generation
-    const raContent = '';
-
     const [configRows]: any = await db.execute("SELECT id FROM aba_openclaw_configs WHERE user_id=?", [userId]);
     if (configRows.length > 0) {
-      await db.execute("UPDATE aba_openclaw_configs SET openclaw_json=?, mo_content=?, tk_content=?, oi_content=?, ra_content=?, generated_at=NOW() WHERE user_id=?", [JSON.stringify(openclawConfig), moContent, tkContent, oiContent, raContent, userId]);
+      await db.execute("UPDATE aba_openclaw_configs SET openclaw_json=?, soul_md=?, knowledge_md=?, persona_md=?, generated_at=NOW() WHERE user_id=?", [JSON.stringify(openclawConfig), soulMd, knowledgeMd, personaMd, userId]);
     } else {
-      await db.execute("INSERT INTO aba_openclaw_configs (user_id, openclaw_json, mo_content, tk_content, oi_content, ra_content, generated_at) VALUES (?, ?, ?, ?, ?, ?, NOW())", [userId, JSON.stringify(openclawConfig), moContent, tkContent, oiContent, raContent]);
+      await db.execute("INSERT INTO aba_openclaw_configs (user_id, openclaw_json, soul_md, knowledge_md, persona_md, generated_at) VALUES (?, ?, ?, ?, ?, NOW())", [userId, JSON.stringify(openclawConfig), soulMd, knowledgeMd, personaMd]);
     }
 
-    res.json({ openclaw_json: openclawConfig, mo_content: moContent, tk_content: tkContent, oi_content: oiContent, ra_content: raContent });
+    res.json({ openclaw_json: openclawConfig, soul_md: soulMd, knowledge_md: knowledgeMd, persona_md: personaMd });
   } catch (err: any) {
     console.error("OpenClaw config error:", err);
     res.status(500).json({ error: "Failed to generate config" });
@@ -1964,7 +1448,7 @@ app.post("/api/create-checkout-session", async (req, res) => {
       success_url: `${req.headers.origin}/#/dashboard/setup?from=quickstart&success=true`,
       cancel_url: `${req.headers.origin}/pricing?canceled=true`,
       ...(userEmail ? { customer_email: userEmail } : {}),
-      metadata: { plan: planName, email: userEmail || '', is_upgrade: 'false' },
+      metadata: { plan: planName, email: userEmail || '', is_upgrade: 'false', migrate: req.body.migrate === false ? 'false' : 'true' },
     });
     res.json({ url: session.url });
   } catch (error: any) {
@@ -2000,7 +1484,7 @@ app.post("/api/subscription/upgrade", authMiddleware, async (req, res) => {
       success_url: `${req.headers.origin}/#/dashboard/subscription?upgrade=true`,
       cancel_url: `${req.headers.origin}/#/dashboard/subscription`,
       customer_email: userEmail,
-      metadata: { plan: planName, email: userEmail, user_id: String(userId), is_upgrade: 'true' },
+      metadata: { plan: planName, email: userEmail, user_id: String(userId), is_upgrade: 'true', migrate: req.body.migrate === false ? 'false' : 'true' },
     });
     res.json({ url: session.url });
   } catch (error: any) {
@@ -2038,9 +1522,6 @@ app.get("/api/admin/users", authMiddleware, async (req, res) => {
 });
 
 // ==================== KNOWLEDGE FILES ====================
-
-const uploadDir = path.join(__dirname, '..', 'uploads');
-fs.mkdirSync(uploadDir, { recursive: true });
 
 const storage = multer.diskStorage({
   destination: (req: any, file: any, cb: any) => {
@@ -2114,85 +1595,17 @@ app.delete("/api/knowledge/files/:id", authMiddleware, async (req, res) => {
   } catch { res.status(500).json({ error: "Failed to delete file" }); }
 });
 
-// ==================== IMAGE UPLOAD (S3) ====================
+// ==================== IMAGE UPLOAD ====================
 
-const s3Client = new S3Client({ region: "us-east-1" });
-const S3_BUCKET = "dabarobjects-uploads";
+const uploadDir = path.join(__dirname, '..', 'uploads');
+fs.mkdirSync(uploadDir, { recursive: true });
 
-// In-memory multer for image uploads (we buffer, then push to S3)
-const imageUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
-
-// Generate a presigned URL valid for N seconds
-async function getPresignedUrl(s3Key: string, expiresIn = 3600): Promise<string> {
-  if (!s3Key) return "";
-  try {
-    const command = new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key });
-    return await getSignedUrl(s3Client, command, { expiresIn });
-  } catch {
-    return "";
-  }
-}
-
-// Upload image to S3
-app.post("/api/upload/image", authMiddleware, imageUpload.single('image'), async (req: any, res) => {
+const imageUpload = multer({ dest: path.join(uploadDir, 'images'), limits: { fileSize: 5 * 1024 * 1024 } });
+app.post("/api/upload/image", imageUpload.single('image'), async (req: any, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-
-    const { userId } = (req as any).user;
-    const ext = path.extname(req.file.originalname) || ".jpg";
-    const s3Key = `products/${userId}/${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
-
-    const command = new PutObjectCommand({
-      Bucket: S3_BUCKET,
-      Key: s3Key,
-      Body: req.file.buffer,
-      ContentType: req.file.mimetype,
-    });
-    await s3Client.send(command);
-
-    // Track storage usage
-    const fileSize = req.file.size;
-    await db.execute(
-      "INSERT INTO aba_storage_usage (user_id, s3_key, file_size, file_type) VALUES (?, ?, ?, 'image') ON DUPLICATE KEY UPDATE file_size = file_size + ?",
-      [userId, s3Key, fileSize, fileSize]
-    );
-
-    // Generate a short-lived preview URL for the frontend
-    const previewUrl = await getPresignedUrl(s3Key, 3600);
-    res.json({ url: s3Key, preview: previewUrl });
-  } catch (err: any) {
-    console.error("S3 upload error:", err);
-    res.status(500).json({ error: "Upload failed" });
-  }
-});
-
-// Generate a presigned URL for a product image
-app.get("/api/products/:id/image-url", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const [rows]: any = await db.execute("SELECT image_s3_key FROM aba_products WHERE id=? AND user_id=?", [req.params.id, userId]);
-    if (!rows.length || !rows[0].image_s3_key) return res.json({ url: null });
-    const url = await getPresignedUrl(rows[0].image_s3_key, 86400);
-    res.json({ url });
-  } catch { res.status(500).json({ error: "Failed to generate URL" }); }
-});
-
-// Get storage usage for current user
-app.get("/api/storage/usage", authMiddleware, async (req, res) => {
-  try {
-    const { userId } = (req as any).user;
-    const [rows]: any = await db.execute(
-      "SELECT COALESCE(SUM(file_size), 0) as total_bytes FROM aba_storage_usage WHERE user_id=?", [userId]
-    );
-    const totalBytes = rows[0]?.total_bytes || 0;
-    res.json({
-      total_bytes: totalBytes,
-      total_mb: (totalBytes / (1024 * 1024)).toFixed(2),
-      limit_bytes: 52428800, // 50 MB per user
-      limit_mb: "50.00",
-      percent: Math.min(100, ((totalBytes / 52428800) * 100)).toFixed(1),
-    });
-  } catch { res.status(500).json({ error: "Failed to get storage usage" }); }
+    res.json({ url: `/uploads/images/${req.file.filename}` });
+  } catch { res.status(500).json({ error: "Upload failed" }); }
 });
 
 // ==================== SERVICE KEYS ====================
@@ -2239,49 +1652,49 @@ app.delete("/api/service-keys/:id", authMiddleware, async (req, res) => {
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-// ==================== MO / TK / OI / RA CONFIG ====================
+// ==================== SOUL CUSTOM CONFIG ====================
 
-app.get("/api/agent-config/motkoi", authMiddleware, async (req, res) => {
+app.get("/api/agent-config/soul", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const [rows]: any = await db.execute(`SELECT custom_greeting AS mo_content, custom_personality_text AS oi_content, timezone, nationality_vibe,
-      custom_instructions AS tk_content, mo_document_path, mo_document_name FROM aba_agent_configs WHERE user_id=?`, [userId]);
+    const [rows]: any = await db.execute(`SELECT custom_greeting, custom_personality_text, timezone, nationality_vibe,
+      custom_instructions, mo_document_path, mo_document_name FROM aba_agent_configs WHERE user_id=?`, [userId]);
     if (rows.length === 0) return res.json({});
     res.json(rows[0]);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-app.put("/api/agent-config/motkoi", authMiddleware, async (req, res) => {
+app.put("/api/agent-config/soul", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const { mo_content, oi_content, timezone, nationality_vibe, tk_content } = req.body;
+    const { custom_greeting, custom_personality_text, timezone, nationality_vibe, custom_instructions } = req.body;
     await db.execute(`UPDATE aba_agent_configs SET
       custom_greeting=?, custom_personality_text=?, timezone=?, nationality_vibe=?, custom_instructions=?
       WHERE user_id=?`,
-      [mo_content||null, oi_content||null, timezone||'Africa/Lagos', nationality_vibe||'Global', tk_content||null, userId]);
+      [custom_greeting||null, custom_personality_text||null, timezone||'Africa/Lagos', nationality_vibe||'Global', custom_instructions||null, userId]);
     res.json({ success: true });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-app.get("/api/team-agents/:id/motkoi", authMiddleware, async (req, res) => {
+app.get("/api/team-agents/:id/soul", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const [rows]: any = await db.execute(`SELECT id, agent_name, role, custom_greeting AS mo_content, custom_personality_text AS oi_content,
-      timezone, nationality_vibe, custom_instructions AS tk_content, mo_document_path, mo_document_name
+    const [rows]: any = await db.execute(`SELECT id, agent_name, role, custom_greeting, custom_personality_text,
+      timezone, nationality_vibe, custom_instructions, mo_document_path, mo_document_name
       FROM aba_team_agents WHERE id=? AND user_id=?`, [req.params.id, userId]);
     if (rows.length === 0) return res.status(404).json({ error: "Team agent not found" });
     res.json(rows[0]);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-app.put("/api/team-agents/:id/motkoi", authMiddleware, async (req, res) => {
+app.put("/api/team-agents/:id/soul", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const { mo_content, oi_content, timezone, nationality_vibe, tk_content } = req.body;
+    const { custom_greeting, custom_personality_text, timezone, nationality_vibe, custom_instructions } = req.body;
     await db.execute(`UPDATE aba_team_agents SET
       custom_greeting=?, custom_personality_text=?, timezone=?, nationality_vibe=?, custom_instructions=?
       WHERE id=? AND user_id=?`,
-      [mo_content||null, oi_content||null, timezone||'Africa/Lagos', nationality_vibe||'Global', tk_content||null, req.params.id, userId]);
+      [custom_greeting||null, custom_personality_text||null, timezone||'Africa/Lagos', nationality_vibe||'Global', custom_instructions||null, req.params.id, userId]);
     res.json({ success: true });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
@@ -2345,47 +1758,47 @@ app.post("/api/build-and-update", authMiddleware, async (req, res) => {
       serviceKeys[sk.service_name] = typeof sk.credentials === 'string' ? JSON.parse(sk.credentials) : sk.credentials;
     }
 
-    // Build MO/TK/OI config
-    const motkoiConfig: Record<string, any> = {
-      mo: cfg.custom_greeting || '',
-      oi: cfg.custom_personality_text || cfg.personality || 'Professional',
+    // Build soul config
+    const soulConfig: Record<string, any> = {
+      greeting: cfg.custom_greeting || '',
+      personality: cfg.custom_personality_text || cfg.personality || 'Professional',
       timezone: cfg.timezone || 'Africa/Lagos',
       nationality_vibe: cfg.nationality_vibe || 'Global',
-      tk: cfg.custom_instructions || '',
+      custom_instructions: cfg.custom_instructions || '',
     };
 
     // MO document content
     if (cfg.mo_document_path && fs.existsSync(cfg.mo_document_path)) {
       try {
-        motkoiConfig.mo_document = fs.readFileSync(cfg.mo_document_path, 'utf8');
+        soulConfig.mo_document = fs.readFileSync(cfg.mo_document_path, 'utf8');
       } catch {}
     }
 
     // Team agents config
     const [teamRows]: any = await db.execute(`SELECT id, agent_name, role, telegram_bot_token, telegram_bot_username,
-      custom_greeting AS mo_content, custom_personality_text AS oi_content, timezone, nationality_vibe, custom_instructions AS tk_content, mo_document_path, mo_document_name
+      custom_greeting, custom_personality_text, timezone, nationality_vibe, custom_instructions, mo_document_path, mo_document_name
       FROM aba_team_agents WHERE user_id=? AND status='active'`, [userId]);
     const teamAgents: any[] = [];
     for (const ta of teamRows) {
-      const taMotkoi: any = {
-        mo: ta.mo_content || '',
-        oi: ta.oi_content || ta.role || 'Professional',
+      const taSoul: any = {
+        greeting: ta.custom_greeting || '',
+        personality: ta.custom_personality_text || ta.role || 'Professional',
         timezone: ta.timezone || 'Africa/Lagos',
         nationality_vibe: ta.nationality_vibe || 'Global',
-        tk: ta.tk_content || '',
+        custom_instructions: ta.custom_instructions || '',
       };
       if (ta.mo_document_path && fs.existsSync(ta.mo_document_path)) {
-        try { taMotkoi.mo_document = fs.readFileSync(ta.mo_document_path, 'utf8'); } catch {}
+        try { taSoul.mo_document = fs.readFileSync(ta.mo_document_path, 'utf8'); } catch {}
       }
       teamAgents.push({
         id: ta.id, name: ta.agent_name, role: ta.role,
         bot_token: ta.telegram_bot_token, bot_username: ta.telegram_bot_username,
-        motkoi: taMotkoi,
+        soul: taSoul,
       });
     }
 
     const payload: any = {
-      env, service_keys: serviceKeys, motkoi: motkoiConfig, team_agents: teamAgents,
+      env, service_keys: serviceKeys, soul: soulConfig, team_agents: teamAgents,
       owner: {
         telegram_id: owner.owner_chat_id || null,
         name: owner.owner_name || userRows[0].name || userRows[0].email,
