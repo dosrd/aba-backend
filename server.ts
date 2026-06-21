@@ -61,40 +61,50 @@ async function initDB() {
     console.log("  ✅ aba_service_keys table ready");
   } catch(e: any) { console.log("  ⚠️ aba_service_keys:", e.message); }
 
-  try {
-    const [cols]: any = await db.execute("SHOW COLUMNS FROM aba_agent_configs LIKE 'custom_greeting'");
-    if (cols.length === 0) {
-      await db.execute(`ALTER TABLE aba_agent_configs
-        ADD COLUMN custom_greeting TEXT,
-        ADD COLUMN custom_personality_text TEXT,
-        ADD COLUMN timezone VARCHAR(64) DEFAULT 'Africa/Lagos',
-        ADD COLUMN nationality_vibe VARCHAR(64) DEFAULT 'Global',
-        ADD COLUMN custom_instructions TEXT,
-        ADD COLUMN mo_document_path VARCHAR(255),
-        ADD COLUMN mo_document_name VARCHAR(255),
-        ADD COLUMN sh_store_id VARCHAR(64),
-        ADD COLUMN shopify_url VARCHAR(255),
-        ADD COLUMN shopify_api_key VARCHAR(255),
-        ADD COLUMN shopify_api_secret VARCHAR(255),
-        ADD COLUMN shopify_access_token VARCHAR(255)`);
-      console.log("  ✅ aba_agent_configs columns added");
-    }
-  } catch(e: any) { console.log("  ⚠️ agent_configs migration:", e.message); }
+  // Add missing columns individually to aba_agent_configs
+  for (const col of ['custom_greeting','custom_personality_text','timezone','nationality_vibe','custom_instructions','mo_document_path','mo_document_name','sh_store_id','shopify_url','shopify_api_key','shopify_api_secret','shopify_access_token']) {
+    try {
+      const [found]: any = await db.execute("SHOW COLUMNS FROM aba_agent_configs LIKE ?", [col]);
+      if (found.length === 0) {
+        const colType: Record<string,string> = {
+          custom_greeting: 'TEXT',
+          custom_personality_text: 'TEXT',
+          timezone: "VARCHAR(64) DEFAULT 'Africa/Lagos'",
+          nationality_vibe: "VARCHAR(64) DEFAULT 'Global'",
+          custom_instructions: 'TEXT',
+          mo_document_path: 'VARCHAR(255)',
+          mo_document_name: 'VARCHAR(255)',
+          sh_store_id: 'VARCHAR(64)',
+          shopify_url: 'VARCHAR(255)',
+          shopify_api_key: 'VARCHAR(255)',
+          shopify_api_secret: 'VARCHAR(255)',
+          shopify_access_token: 'VARCHAR(255)'
+        };
+        await db.execute(`ALTER TABLE aba_agent_configs ADD COLUMN \`${col}\` ${colType[col] || 'TEXT'}`);
+        console.log(`  ✅ aba_agent_configs.\`${col}\` added`);
+      }
+    } catch(e: any) { console.log(`  ⚠️ agent_configs.\`${col}\` migration:`, e.message); }
+  }
 
-  try {
-    const [tcols]: any = await db.execute("SHOW COLUMNS FROM aba_team_agents LIKE 'custom_greeting'");
-    if (tcols.length === 0) {
-      await db.execute(`ALTER TABLE aba_team_agents
-        ADD COLUMN custom_greeting TEXT,
-        ADD COLUMN custom_personality_text TEXT,
-        ADD COLUMN timezone VARCHAR(64) DEFAULT 'Africa/Lagos',
-        ADD COLUMN nationality_vibe VARCHAR(64) DEFAULT 'Global',
-        ADD COLUMN custom_instructions TEXT,
-        ADD COLUMN mo_document_path VARCHAR(255),
-        ADD COLUMN mo_document_name VARCHAR(255)`);
-      console.log("  ✅ aba_team_agents columns added");
-    }
-  } catch(e: any) { console.log("  ⚠️ team_agents migration:", e.message); }
+  // Add missing columns individually so earlier migrations don't block later ones
+  for (const col of ['custom_greeting','custom_personality_text','timezone','nationality_vibe','custom_instructions','mo_document_path','mo_document_name']) {
+    try {
+      const [found]: any = await db.execute("SHOW COLUMNS FROM aba_team_agents LIKE ?", [col]);
+      if (found.length === 0) {
+        const colType: Record<string,string> = {
+          custom_greeting: 'TEXT',
+          custom_personality_text: 'TEXT',
+          timezone: "VARCHAR(64) DEFAULT 'Africa/Lagos'",
+          nationality_vibe: "VARCHAR(64) DEFAULT 'Global'",
+          custom_instructions: 'TEXT',
+          mo_document_path: 'VARCHAR(255)',
+          mo_document_name: 'VARCHAR(255)'
+        };
+        await db.execute(`ALTER TABLE aba_team_agents ADD COLUMN \`${col}\` ${colType[col] || 'TEXT'}`);
+        console.log(`  ✅ aba_team_agents.\`${col}\` added`);
+      }
+    } catch(e: any) { console.log(`  ⚠️ team_agents.\`${col}\` migration:`, e.message); }
+  }
 
   try {
     const [ok]: any = await db.execute("SHOW COLUMNS FROM aba_deployments LIKE 'owner_name'");
