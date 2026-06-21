@@ -1854,6 +1854,73 @@ app.post("/api/deploy/restart", authMiddleware, async (req, res) => {
   }
 });
 
+app.post("/api/deploy/repair", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+
+    const [rows]: any = await db.execute("SELECT * FROM aba_deployments WHERE user_id=? AND status='active'", [userId]);
+    if (rows.length === 0) return res.status(400).json({ error: "No active deployment to repair" });
+    const dep = rows[0];
+    if (!dep.public_ip) return res.status(400).json({ error: "Deployment has no IP address" });
+
+    const sshTarget = `ubuntu@${dep.public_ip}`;
+    const sshKey = process.env.SSH_KEY_PATH || "/root/.ssh/aba-agent-provision.pem";
+
+    // Step 1: Run doctor --fix and capture output
+    let doctorOutput = "";
+    try {
+      doctorOutput = execSync(
+        `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ${sshKey} ${sshTarget} ` +
+        `"sudo /usr/bin/openclaw doctor --fix 2>&1; echo 'EXIT_CODE:'$?" 2>/dev/null || true`,
+        { timeout: 120000, maxBuffer: 50 * 1024 }
+      ).toString().trim();
+    } catch (e: any) {
+      doctorOutput = "Repair command failed: " + (e.message || "unknown");
+    }
+
+    // Extract exit code
+    const exitMatch = doctorOutput.match(/EXIT_CODE:(\d+)/);
+    const exitCode = exitMatch ? parseInt(exitMatch[1]) : -1;
+
+    // Step 2: Restart openclaw service
+    let restartOk = false;
+    try {
+      const restartOut = execSync(
+        `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ${sshKey} ${sshTarget} ` +
+        `"sudo systemctl restart openclaw 2>&1; sleep 3; sudo systemctl is-active openclaw" 2>/dev/null || true`,
+        { timeout: 30000 }
+      ).toString().trim();
+      restartOk = restartOut === "active";
+    } catch {}
+
+    // Extract meaningful summary from doctor output
+    const summaryLines: string[] = [];
+    const lines = doctorOutput.split('\n');
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('◇') || trimmed.startsWith('│')) continue;
+      if (trimmed.startsWith('Config auto-restored') ||
+          trimmed.startsWith('Restored') ||
+          trimmed.includes('doctor') && trimmed.includes('fix') ||
+          trimmed.includes('ready') ||
+          trimmed.match(/EXIT_CODE/)) {
+        summaryLines.push(trimmed.replace(/^[•\-]\s*/, ''));
+      }
+    }
+
+    res.json({
+      success: exitCode === 0 || restartOk,
+      restartOk,
+      exitCode,
+      summary: summaryLines.join('\n') || (exitCode === 0 ? 'Doctor completed and service restarted.' : 'Doctor encountered issues.'),
+      rawOutput: doctorOutput.substring(0, 2000)
+    });
+  } catch (err: any) {
+    console.error("Repair error:", err);
+    res.status(500).json({ error: "Repair failed: " + (err.message || "unknown error") });
+  }
+});
+
 app.post("/api/deploy/backup", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
