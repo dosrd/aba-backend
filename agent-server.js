@@ -88,7 +88,7 @@ function createServer() {
         }
 
         // Run in background (detached so it survives agent-server restart)
-        const child = spawn('node', ['/tmp/gen-wa-qr-v4.js'], {
+        const child = spawn('/usr/bin/node', ['/tmp/gen-wa-qr-v4.js'], {
           cwd: WA_EXTENSIONS,
           env: {
             ...process.env,
@@ -148,7 +148,7 @@ function createServer() {
         }
 
         // Spawn fresh pairing
-        const child = spawn('node', ['/tmp/gen-wa-qr-v4.js'], {
+        const child = spawn('/usr/bin/node', ['/tmp/gen-wa-qr-v4.js'], {
           cwd: WA_EXTENSIONS,
           env: {
             ...process.env,
@@ -179,6 +179,11 @@ function createServer() {
       try {
         const status = JSON.parse(statusRaw);
         if (status.stage === 'qr_ready') {
+          // Use qr_data_url from status JSON if embedded by the script (avoids read race)
+          if (status.qr_data_url) {
+            return json(res, 200, { stage: 'qr_ready', qr_data_url: status.qr_data_url, ts: status.ts });
+          }
+          // Fallback: read the PNG file directly
           let qrBuf = null;
           try { qrBuf = fs.readFileSync('/tmp/wa-qr-clean.png'); } catch {}
           if (!qrBuf) return json(res, 200, { stage: 'qr_ready', ts: status.ts });
@@ -302,7 +307,7 @@ function createServer() {
         var teamScriptPath = '/tmp/gen-wa-qr-team-' + agentId + '.js';
         fs.writeFileSync(teamScriptPath, scriptContent);
 
-        const child = spawn('node', [teamScriptPath], {
+        const child = spawn('/usr/bin/node', [teamScriptPath], {
           cwd: WA_EXTENSIONS,
           env: {
             ...process.env,

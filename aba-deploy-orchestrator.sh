@@ -638,6 +638,12 @@ with open("/home/ubuntu/.openclaw/openclaw.json", "w") as f:
     f.write(config_json)
 print("✅ openclaw.json written")
 
+# WhatsApp pairing dependencies
+print("\n### WhatsApp pairing dependencies ###")
+sh("sudo apt-get install -y qrencode -qq")
+sh("mkdir -p /home/ubuntu/.openclaw/extensions")
+sh("cd /home/ubuntu/.openclaw/extensions && npm install @whiskeysockets/baileys qrcode-terminal --no-optional 2>&1 | tail -3")
+
 # Fix permissions (critical — gateway runs as ubuntu, not root)
 sh("sudo chown -R ubuntu:ubuntu /home/ubuntu/.openclaw")
 sh("sudo chmod -R u+rwX /home/ubuntu/.openclaw")
@@ -846,7 +852,7 @@ function createServer() {
         await new Promise(r => setTimeout(r, 500));
         if (body && body.script_content) fs.writeFileSync(\'/tmp/gen-wa-qr-v4.js\', body.script_content);
         if (!fs.existsSync(\'/tmp/gen-wa-qr-v4.js\')) return json(res, 400, { error: \'Script not found\' });
-        const child = spawn(\'node\', [\'/tmp/gen-wa-qr-v4.js\'], {
+        const child = spawn(\'/usr/bin/node\', [\'/tmp/gen-wa-qr-v4.js\'], {
           cwd: WA_EXTENSIONS,
           env: { ...process.env, NODE_PATH: WA_EXTENSIONS + \'/node_modules\', HOME: process.env.HOME },
           stdio: [\'ignore\', fs.openSync(\'/tmp/wa-pairing-output.log\', \'a\'), fs.openSync(\'/tmp/wa-pairing-output.log\', \'a\')],
@@ -863,6 +869,11 @@ function createServer() {
       try {
         const st = JSON.parse(s);
         if (st.stage === \'qr_ready\') {
+          // Use qr_data_url from status JSON if available (avoids file-read race)
+          if (st.qr_data_url) {
+            return json(res, 200, { stage: \'qr_ready\', qr_data_url: st.qr_data_url, ts: st.ts });
+          }
+          // Fallback: read PNG directly
           const q = readFile(\'/tmp/wa-qr-clean.png\', \'binary\');
           return json(res, 200, { stage: \'qr_ready\', qr_data_url: q ? \'data:image/png;base64,\' + Buffer.from(q, \'binary\').toString(\'base64\') : null, ts: st.ts });
         }
