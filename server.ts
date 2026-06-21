@@ -2362,18 +2362,34 @@ app.get("/api/products/:id/image-url", authMiddleware, async (req, res) => {
 app.get("/api/storage/usage", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
+
+    // 1. Sum product images from DB (if any)
     const [rows]: any = await db.execute(
       "SELECT COALESCE(SUM(file_size), 0) as total_bytes FROM aba_storage_usage WHERE user_id=?", [userId]
     );
-    const totalBytes = rows[0]?.total_bytes || 0;
+    let totalBytes = parseInt(rows[0]?.total_bytes || 0, 10);
+
+    // 2. Sum workspace backups from S3 directly
+    try {
+      const s3Backups = require('child_process').execSync(
+        `aws s3 ls --recursive --summarize s3://aba-backups/${userId}/ --region us-east-1 2>/dev/null | grep "Total Size:" | awk '{print $3}'`,
+        { timeout: 10000 }
+      ).toString().trim();
+      if (s3Backups && !isNaN(parseInt(s3Backups, 10))) {
+        totalBytes += parseInt(s3Backups, 10);
+      }
+    } catch (e) {
+      // Ignore S3 errors if bucket or prefix doesn't exist
+    }
+
     res.json({
       total_bytes: totalBytes,
       total_mb: (totalBytes / (1024 * 1024)).toFixed(2),
-      limit_bytes: 52428800, // 50 MB per user
-      limit_mb: "50.00",
-      percent: Math.min(100, ((totalBytes / 52428800) * 100)).toFixed(1),
+      limit_bytes: 524288000, // Increased to 500 MB because backups are large (~150MB each)
+      limit_mb: "500.00",
+      percent: Math.min(100, ((totalBytes / 524288000) * 100)).toFixed(1),
     });
-  } catch { res.status(500).json({ error: "Failed to get storage usage" }); }
+  } catch (err: any) { res.status(500).json({ error: "Failed to get storage usage" }); }
 });
 
 // ==================== SERVICE KEYS ====================
