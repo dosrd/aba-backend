@@ -1752,10 +1752,23 @@ app.get("/api/deploy", authMiddleware, async (req, res) => {
     const [rows]: any = await db.execute("SELECT * FROM aba_deployments WHERE user_id = ?", [userId]);
     if (rows.length === 0) return res.json({ status: null });
     const d = rows[0];
+
+    // Detect stale deployments: DB says active but EC2 instance is gone
+    let stale = false;
+    if (d.status === 'active' && d.instance_id) {
+      try {
+        const out = execSync(`aws ec2 describe-instances --instance-ids ${d.instance_id} --region us-east-1 --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null`, { timeout: 10000 });
+        const state = out.toString().trim();
+        if (state !== 'running') stale = true;
+      } catch {
+        stale = true; // describe failed = instance gone
+      }
+    }
+
     res.json({ id: d.id, status: d.status, instanceId: d.instance_id, publicIp: d.public_ip,
       telegramUsername: d.telegram_bot_username, errorMessage: d.error_message, bindCode: d.bind_code,
       ownerChatId: d.owner_chat_id, ownerName: d.owner_name, deployedAt: d.deployed_at, decommissionedAt: d.decommissioned_at,
-      createdAt: d.created_at });
+      createdAt: d.created_at, stale });
   } catch { res.status(500).json({ error: "Failed to fetch deployment" }); }
 });
 
@@ -1803,6 +1816,94 @@ app.post("/api/deploy", authMiddleware, async (req, res) => {
   } catch (err: any) {
     console.error("Deploy error:", err);
     res.status(500).json({ error: "Failed to queue deployment" });
+  }
+});
+
+app.post("/api/deploy/restart", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+
+    const [rows]: any = await db.execute("SELECT * FROM aba_deployments WHERE user_id=?", [userId]);
+    if (rows.length === 0) return res.status(400).json({ error: "No deployment found to restart" });
+    const dep = rows[0];
+
+    // Try to terminate the old instance if it still exists
+    if (dep.instance_id) {
+      try {
+        execSync(`aws ec2 terminate-instances --instance-ids ${dep.instance_id} --region us-east-1`, { timeout: 15000, stdio: 'pipe' });
+      } catch (e: any) {
+        // Instance may already be gone — that's fine
+      }
+    }
+
+    // Set RESTORE_NEEDED marker in S3 so orchestrator restores backup
+    try {
+      execSync(`echo "1" | aws s3 cp - "s3://aba-backups/${userId}/RESTORE_NEEDED" --region us-east-1 2>/dev/null || true`, { timeout: 10000 });
+    } catch {}
+
+    // Reset deployment to pending so orchestrator picks it up
+    await db.execute(
+      "UPDATE aba_deployments SET status='pending', error_message=NULL, instance_id=NULL, public_ip=NULL, deployed_at=NULL, updated_at=NOW() WHERE id=?",
+      [dep.id]
+    );
+
+    res.json({ success: true, message: "Restart queued. Instance will be recreated with backup restored." });
+  } catch (err: any) {
+    console.error("Restart error:", err);
+    res.status(500).json({ error: "Failed to restart deployment" });
+  }
+});
+
+app.post("/api/deploy/backup", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+
+    const [rows]: any = await db.execute("SELECT * FROM aba_deployments WHERE user_id=? AND status='active'", [userId]);
+    if (rows.length === 0) return res.status(400).json({ error: "No active deployment to backup" });
+    const dep = rows[0];
+    if (!dep.public_ip) return res.status(400).json({ error: "Deployment has no IP address" });
+
+    const BACKUP_DIR = "/tmp/aba-backups";
+    const backupFile = `${BACKUP_DIR}/workspace-${userId}.tar.gz`;
+
+    // SSH into the EC2, tar the workspace
+    execSync(`mkdir -p ${BACKUP_DIR}`, { timeout: 5000 });
+    const sshTarget = `ubuntu@${dep.public_ip}`;
+    const sshKey = process.env.SSH_KEY_PATH || "/root/.ssh/aba-agent-provision.pem";
+
+    // Create backup on EC2
+    const remoteBackupCmd = `tar czf /tmp/workspace-backup.tar.gz -C /home/ubuntu .openclaw 2>/dev/null; echo "BACKUP_DONE:$?"`;
+    const result = execSync(
+      `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ${sshKey} ${sshTarget} "${remoteBackupCmd}"`,
+      { timeout: 30000 }
+    ).toString().trim();
+
+    if (!result.includes("BACKUP_DONE:0")) {
+      return res.status(500).json({ error: "Failed to create backup on remote server" });
+    }
+
+    // SCP it back
+    execSync(
+      `scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ${sshKey} ${sshTarget}:/tmp/workspace-backup.tar.gz ${backupFile}`,
+      { timeout: 60000 }
+    );
+
+    // Upload to S3
+    execSync(
+      `aws s3 cp ${backupFile} s3://aba-backups/${userId}/workspace-backup.tar.gz --region us-east-1`,
+      { timeout: 30000 }
+    );
+
+    // Set restore marker
+    execSync(`echo "1" | aws s3 cp - "s3://aba-backups/${userId}/RESTORE_NEEDED" --region us-east-1 2>/dev/null || true`, { timeout: 10000 });
+
+    // Cleanup
+    execSync(`rm -f ${backupFile}`, { timeout: 5000 });
+
+    res.json({ success: true, message: "Backup completed and stored in S3. Restore marker set." });
+  } catch (err: any) {
+    console.error("Backup error:", err);
+    res.status(500).json({ error: "Backup failed: " + (err.message || "unknown error") });
   }
 });
 
