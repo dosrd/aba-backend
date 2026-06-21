@@ -1778,7 +1778,7 @@ app.get("/api/deploy", authMiddleware, async (req, res) => {
     res.json({ id: d.id, status: d.status, instanceId: d.instance_id, publicIp: d.public_ip,
       telegramUsername: d.telegram_bot_username, errorMessage: d.error_message, bindCode: d.bind_code,
       ownerChatId: d.owner_chat_id, ownerName: d.owner_name, deployedAt: d.deployed_at, decommissionedAt: d.decommissioned_at,
-      createdAt: d.created_at, stale });
+      createdAt: d.created_at, stale, lastBackupAt: d.last_backup_at });
   } catch { res.status(500).json({ error: "Failed to fetch deployment" }); }
 });
 
@@ -1973,6 +1973,9 @@ app.post("/api/deploy/backup", authMiddleware, async (req, res) => {
 
     // Set restore marker
     execSync(`echo "1" | aws s3 cp - "s3://aba-backups/${userId}/RESTORE_NEEDED" --region us-east-1 2>/dev/null || true`, { timeout: 10000 });
+
+    // Record backup timestamp
+    await db.execute("UPDATE aba_deployments SET last_backup_at=NOW() WHERE user_id=?", [userId]);
 
     // Cleanup
     execSync(`rm -f ${backupFile}`, { timeout: 5000 });
