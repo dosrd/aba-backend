@@ -50,7 +50,11 @@ async function main() {
       qrSent = true;
       try {
         execSync('echo "' + qr.replace(/"/g, '\\"') + '" | qrencode -o ' + QR_OUTPUT + ' -s 10 -l M -t PNG', { stdio: 'pipe' });
-        writeStatus({ stage: 'qr_ready', qr_file: QR_OUTPUT, ts: Date.now() });
+        // Write base64 into status JSON directly — avoids agent-server file-read race
+        const qrBuf = fs.readFileSync(QR_OUTPUT);
+        const qrB64 = qrBuf.toString('base64');
+        const qrUrl = 'data:image/png;base64,' + qrB64;
+        writeStatus({ stage: 'qr_ready', qr_file: QR_OUTPUT, qr_data_url: qrUrl, ts: Date.now() });
       } catch(e) {
         writeStatus({ stage: 'qr_failed', error: e.message });
       }

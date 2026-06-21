@@ -639,14 +639,16 @@ with open("/home/ubuntu/.openclaw/openclaw.json", "w") as f:
 print("✅ openclaw.json written")
 
 # WhatsApp pairing dependencies
-print("\n### WhatsApp pairing dependencies ###")
+print("\n### WhatsApp plugin & dependencies ###")
 sh("sudo apt-get install -y qrencode -qq")
-sh("mkdir -p /home/ubuntu/.openclaw/extensions")
-sh("cd /home/ubuntu/.openclaw/extensions && npm install @whiskeysockets/baileys qrcode-terminal --no-optional 2>&1 | tail -3")
 
-# Fix permissions (critical — gateway runs as ubuntu, not root)
+# Fix permissions early so ubuntu user can install plugins
 sh("sudo chown -R ubuntu:ubuntu /home/ubuntu/.openclaw")
 sh("sudo chmod -R u+rwX /home/ubuntu/.openclaw")
+
+sh("sudo -u ubuntu openclaw plugins install clawhub:@openclaw/whatsapp || true")
+sh("sudo -u ubuntu mkdir -p /home/ubuntu/.openclaw/extensions/whatsapp")
+sh("cd /home/ubuntu/.openclaw/extensions/whatsapp && sudo -u ubuntu npm install @whiskeysockets/baileys@6 jimp qrcode-terminal --no-optional --no-save 2>&1 | tail -3")
 
 # SOUL.md
 soul_content = base64.b64decode(SOUL_B64).decode()

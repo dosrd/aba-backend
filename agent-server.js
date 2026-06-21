@@ -125,6 +125,17 @@ function createServer() {
         // Kill any running pair script
         exec('pkill -f "gen-wa-qr-v4" 2>/dev/null; true', { timeout: 10000 }, () => {});
 
+        // Remove just the default account from config to cleanly unload it before wiping creds
+        try {
+          const confPath = '/home/ubuntu/.openclaw/openclaw.json';
+          const conf = JSON.parse(require('fs').readFileSync(confPath, 'utf-8'));
+          if (conf.channels && conf.channels.whatsapp && conf.channels.whatsapp.accounts && conf.channels.whatsapp.accounts.default) {
+            delete conf.channels.whatsapp.accounts.default;
+            require('fs').writeFileSync(confPath, JSON.stringify(conf, null, 2));
+            require('child_process').execSync('sleep 3'); // Give hot-reload time to stop the provider
+          }
+        } catch(e) {}
+
         // Remove old WhatsApp credentials so Baileys starts fresh
         try { fs.rmSync(WA_CREDS_DIR, { recursive: true, force: true }); } catch {}
 
@@ -348,6 +359,10 @@ function createServer() {
       try {
         const status = JSON.parse(statusRaw);
         if (status.stage === 'qr_ready') {
+          // Use qr_data_url from status JSON if embedded by the script (avoids read race)
+          if (status.qr_data_url) {
+            return json(res, 200, { stage: 'qr_ready', qr_data_url: status.qr_data_url, agent_id: parseInt(agentId, 10), ts: status.ts });
+          }
           var qrPath = '/tmp/wa-qr-team-' + agentId + '.png';
           var qrBuf = null;
           try { qrBuf = fs.readFileSync(qrPath); } catch {}
