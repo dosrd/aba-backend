@@ -98,6 +98,53 @@ mysql -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "
   fi
 done
 
+# ─── Step 1a: Auto-backup active deployments ────────────────
+# Runs in background so it doesn't block the deploy pipeline.
+# Backs up one random healthy deployment per cycle (max 1 per 2 min).
+# Skips if S3 backup is <12h old.
+({
+  log "Checking active deployments for auto-backup..."
+  mysql -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "
+    SELECT d.id, d.user_id, d.public_ip
+    FROM aba_deployments d
+    WHERE d.status = 'active'
+      AND d.public_ip IS NOT NULL
+      AND d.last_health_check > NOW() - INTERVAL 30 MINUTE
+    ORDER BY RAND()
+    LIMIT 1
+  " 2>/dev/null | while read -r DEPLOY_ID USER_ID PUBLIC_IP; do
+    # Check if S3 backup is fresh (<12h), skip if so
+    S3_LS=$(aws s3 ls "s3://${BACKUP_BUCKET:-aba-backups}/${USER_ID}/workspace-backup.tar.gz" --region "$REGION" 2>/dev/null || true)
+    if [ -n "$S3_LS" ]; then
+      BACKUP_TS=$(echo "$S3_LS" | awk '{print $1" "$2}' 2>/dev/null)
+      BACKUP_EPOCH=$(date -d "$BACKUP_TS" +%s 2>/dev/null || echo 0)
+      NOW_EPOCH=$(date +%s)
+      AGE=$((NOW_EPOCH - BACKUP_EPOCH))
+      if [ "$AGE" -lt 43200 ]; then
+        log "⏭️  Backup for user $USER_ID is ${AGE}s old (<12h), skipping"
+        continue
+      fi
+    fi
+    log "📦 Auto-backing up deploy #$DEPLOY_ID (user $USER_ID) from $PUBLIC_IP"
+    BACKUP_FILE="/tmp/aba-backup-${DEPLOY_ID}.tar.gz"
+    SSH_OK=0
+    if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i "$SSH_KEY_PATH" "ubuntu@$PUBLIC_IP" \
+      "tar czf /tmp/workspace-backup.tar.gz -C /home/ubuntu .openclaw 2>/dev/null; echo 'DONE:$?'" 2>/dev/null | tail -1 | grep -q "DONE:0"; then
+      SSH_OK=1
+    fi
+    if [ "$SSH_OK" = "1" ] && scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i "$SSH_KEY_PATH" \
+      "ubuntu@$PUBLIC_IP:/tmp/workspace-backup.tar.gz" "$BACKUP_FILE" 2>/dev/null; then
+      aws s3 cp "$BACKUP_FILE" "s3://${BACKUP_BUCKET:-aba-backups}/${USER_ID}/workspace-backup.tar.gz" --region "$REGION" 2>/dev/null || true
+      echo "1" | aws s3 cp - "s3://${BACKUP_BUCKET:-aba-backups}/${USER_ID}/RESTORE_NEEDED" --region "$REGION" 2>/dev/null || true
+      log "✅ Auto-backup complete for user $USER_ID"
+    else
+      log "⚠️  Auto-backup failed for deploy #$DEPLOY_ID (SSH_OK=$SSH_OK)"
+    fi
+    rm -f "$BACKUP_FILE" 2>/dev/null
+  done
+  log "Backup scan done."
+} &)
+
 # ─── Step 1: Recover stale provisioning (>15 min) ─────────
 STALE=$(mysql -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "
   SELECT COUNT(*) FROM aba_deployments
