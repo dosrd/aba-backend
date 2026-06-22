@@ -530,6 +530,23 @@ app.put("/api/business", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
     const { business_name, description, industry, registration_id, tax_id, phone, website, address, logo_url, social_facebook, social_twitter, social_linkedin, social_instagram, primary_currency } = req.body;
+    // Basic validation: phone should look like a phone number
+    if (phone && phone.trim()) {
+      // Allow digits, +, -, (, ), spaces, . , x , ext
+      const cleanedPhone = phone.replace(/[\s\-\(\)\.\,\+extEXT]/g, '');
+      if (cleanedPhone.length > 0 && !/^\d+$/.test(cleanedPhone)) {
+        return res.status(400).json({ error: "Phone number contains invalid characters. Use digits, +, -, (, ), and spaces only." });
+      }
+      if (cleanedPhone.length > 0 && cleanedPhone.length < 6) {
+        return res.status(400).json({ error: "Phone number is too short. Enter a valid phone number." });
+      }
+    }
+    // Basic validation: website URL
+    if (website && website.trim()) {
+      try { new URL(website); } catch {
+        return res.status(400).json({ error: "Website URL is not valid. Enter a full URL like https://yourbusiness.com" });
+      }
+    }
     const [existing]: any = await db.execute("SELECT id FROM aba_businesses WHERE user_id = ?", [userId]);
     if (existing.length > 0) {
       await db.execute(
@@ -544,7 +561,10 @@ app.put("/api/business", authMiddleware, async (req, res) => {
     }
     const [rows]: any = await db.execute("SELECT * FROM aba_businesses WHERE user_id = ?", [userId]);
     res.json(rows[0]);
-  } catch { res.status(500).json({ error: "Failed to update business" }); }
+  } catch(e: any) {
+    console.error("PUT /api/business error:", e?.message || e);
+    res.status(500).json({ error: e?.message || "Failed to update business. Please try again." });
+  }
 });
 
 // ==================== PRODUCTS ====================
@@ -2371,14 +2391,15 @@ app.get("/api/storage/usage", authMiddleware, async (req, res) => {
 
     // 2. Sum workspace backups from S3 directly
     try {
-      const s3Backups = require('child_process').execSync(
+      const s3Backups = execSync(
         `aws s3 ls --recursive --summarize s3://aba-backups/${userId}/ --region us-east-1 2>/dev/null | grep "Total Size:" | awk '{print $3}'`,
         { timeout: 10000 }
       ).toString().trim();
       if (s3Backups && !isNaN(parseInt(s3Backups, 10))) {
         totalBytes += parseInt(s3Backups, 10);
       }
-    } catch (e) {
+    } catch (e: any) {
+      console.error("S3 Backup Size error:", e.message);
       // Ignore S3 errors if bucket or prefix doesn't exist
     }
 

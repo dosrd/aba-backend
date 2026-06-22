@@ -4,6 +4,22 @@ Issues affecting the backend API (`server.ts`), agent-server (`agent-server.js`)
 
 ---
 
+## #4 — WhatsApp Link UI Not Transitioning (Agent Not Responding)
+
+| Field | Value |
+|-------|-------|
+| **Date** | 2026-06-21 |
+| **Summary** | Scanned WhatsApp QR and linked phone successfully, but UI never changed to "Connected" and agent didn't respond to WA messages |
+| **Symptoms** | QR code kept reloading even after successful scan. WhatsApp channel wasn't bound in OpenClaw. |
+| **Root Cause** | Two layered issues: (1) During auto-activate, the backend tried to install the WhatsApp plugin, but OpenClaw was v2026.6.8 and the plugin required >=v2026.6.9. Install failed silently → no openclaw.json channel patch. (2) When testing "Reconnect", OpenClaw stayed running with the old session in memory, causing a conflict when fresh creds were written → session immediately logged out. |
+| **Resolution** | Upgraded OpenClaw to `2026.6.9`. Updated orchestrator to automatically install the WhatsApp plugin and Baileys dependencies correctly on EC2 provision. Updated `agent-server.js` `/whatsapp/reconnect` to gracefully unload the specific WhatsApp account from `openclaw.json` *before* wiping creds, avoiding the session conflict. Fixed `gen-wa-qr-v4-team.js` to also embed `qr_data_url`. |
+| **Files changed** | `aba-deploy-orchestrator.sh`, `agent-server.js`, `gen-wa-qr-v4-team.js` |
+| **Commit** | `9336532` — "fix: make WhatsApp pairing robust for new deployments and reconnects" |
+| **Verified** | UI updates to "Connected" properly, agent receives and answers WhatsApp messages. ✅ |
+| **Prevention** | Orchestrator now enforces the plugin installation directly, and OpenClaw handles the config hot-reload gracefully during reconnects. |
+
+---
+
 ## #3 — WhatsApp QR Code Not Displaying (Corrupted Base64)
 
 | Field | Value |
