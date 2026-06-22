@@ -2528,89 +2528,64 @@ app.post("/api/team-agents/:id/upload-mo", authMiddleware, upload.single('file')
 
 // ==================== BUILD & UPDATE (agent-sync queue) ====================
 
-app.post("/api/build-and-update", authMiddleware, async (req, res) => {
+// ==================== AGENT UPLOAD (for agent sync) ====================
+
+const agentUpload = multer({ dest: path.join(uploadDir, 'agent'), limits: { fileSize: 50 * 1024 * 1024 } });
+app.post("/api/agent-upload", agentUpload.single('file'), async (req: any, res) => {
+  try {
+    const token = req.query.token || req.body.token;
+    if (token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: "Invalid token" });
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    const newPath = path.join(path.dirname(req.file.path), req.file.originalname);
+    fs.renameSync(req.file.path, newPath);
+    res.json({ success: true, url: `/uploads/agent/${req.file.originalname}` });
+  } catch { res.status(500).json({ error: "Upload failed" }); }
+});
+
+// ==================== BUILD & UPDATE (agent-sync queue) ====================
+
+// Compatibility alias — frontend Tools page calls POST /api/agent-sync
+app.post("/api/agent-sync", authMiddleware, async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    // Gather all config for this user
-    const [userRows]: any = await db.execute("SELECT id, email, name FROM aba_users WHERE id=?", [userId]);
-    if (userRows.length === 0) return res.status(404).json({ error: "User not found" });
-    const [cfgRows]: any = await db.execute("SELECT * FROM aba_agent_configs WHERE user_id=?", [userId]);
-    const [skRows]: any = await db.execute("SELECT service_name, credentials FROM aba_service_keys WHERE user_id=? AND is_active=1", [userId]);
-    const [depRows]: any = await db.execute("SELECT owner_chat_id, owner_name FROM aba_deployments WHERE user_id=? ORDER BY id DESC LIMIT 1", [userId]);
+    const [depRows]: any = await db.execute("SELECT public_ip, instance_id FROM aba_deployments WHERE user_id=? ORDER BY id DESC LIMIT 1", [userId]);
+    const dep = depRows[0];
 
-    const cfg = cfgRows[0] || {};
-    const owner = depRows[0] || {};
+    // Queue the build payload via the canonical endpoint
+    const payload: any = await buildUpdatePayload(userId);
+    if (!payload) return res.status(404).json({ error: "User not found" });
 
-    // Build env vars
-    const env: Record<string, string> = {};
-    if (cfg.email_pop_host) env.EMAIL_HOST = cfg.email_pop_host;
-    if (cfg.email_pop_port) env.EMAIL_PORT = String(cfg.email_pop_port);
-    if (cfg.email_pop_user) env.EMAIL_USER = cfg.email_pop_user;
-    if (cfg.email_pop_pass) env.EMAIL_PASS = cfg.email_pop_pass;
-    if (cfg.woo_url) env.WOO_URL = cfg.woo_url;
-    if (cfg.woo_key) env.WOO_KEY = cfg.woo_key;
-    if (cfg.woo_secret) env.WOO_SECRET = cfg.woo_secret;
-    if (cfg.shopify_url) env.SHOPIFY_URL = cfg.shopify_url;
-    if (cfg.shopify_api_key) env.SHOPIFY_API_KEY = cfg.shopify_api_key;
-    if (cfg.shopify_api_secret) env.SHOPIFY_API_SECRET = cfg.shopify_api_secret;
-    if (cfg.shopify_access_token) env.SHOPIFY_ACCESS_TOKEN = cfg.shopify_access_token;
-    if (cfg.db_connection_string) env.DB_CONNECTION_STRING = cfg.db_connection_string;
-    if (cfg.sh_store_id) env.SH_STORE_ID = cfg.sh_store_id;
+    await db.execute("UPDATE aba_deployments SET pending_build_at=NOW(), build_payload=? WHERE user_id=? ORDER BY id DESC LIMIT 1",
+      [JSON.stringify(payload), userId]);
 
-    // Build service keys map
-    const serviceKeys: Record<string, any> = {};
-    for (const sk of skRows) {
-      serviceKeys[sk.service_name] = typeof sk.credentials === 'string' ? JSON.parse(sk.credentials) : sk.credentials;
-    }
-
-    // Build MO/TK/OI config
-    const motkoiConfig: Record<string, any> = {
-      mo: cfg.custom_greeting || '',
-      oi: cfg.custom_personality_text || cfg.personality || 'Professional',
-      timezone: cfg.timezone || 'Africa/Lagos',
-      nationality_vibe: cfg.nationality_vibe || 'Global',
-      tk: cfg.custom_instructions || '',
-    };
-
-    // MO document content
-    if (cfg.mo_document_path && fs.existsSync(cfg.mo_document_path)) {
+    // If we have an active EC2 instance, restart openclaw instantly so config takes effect NOW
+    let instantRestart = false;
+    if (dep && dep.public_ip) {
       try {
-        motkoiConfig.mo_document = fs.readFileSync(cfg.mo_document_path, 'utf8');
+        const sshKey = process.env.SSH_KEY_PATH || "/root/.ssh/aba-agent-provision.pem";
+        const result = execSync(
+          `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ${sshKey} ubuntu@${dep.public_ip} "sudo systemctl restart openclaw 2>&1; sleep 3; sudo systemctl is-active openclaw" 2>/dev/null || true`,
+          { timeout: 20000 }
+        ).toString().trim();
+        if (result === "active") instantRestart = true;
       } catch {}
     }
 
-    // Team agents config
-    const [teamRows]: any = await db.execute(`SELECT id, agent_name, role, telegram_bot_token, telegram_bot_username,
-      custom_greeting AS mo_content, custom_personality_text AS oi_content, timezone, nationality_vibe, custom_instructions AS tk_content, mo_document_path, mo_document_name
-      FROM aba_team_agents WHERE user_id=? AND status='active'`, [userId]);
-    const teamAgents: any[] = [];
-    for (const ta of teamRows) {
-      const taMotkoi: any = {
-        mo: ta.mo_content || '',
-        oi: ta.oi_content || ta.role || 'Professional',
-        timezone: ta.timezone || 'Africa/Lagos',
-        nationality_vibe: ta.nationality_vibe || 'Global',
-        tk: ta.tk_content || '',
-      };
-      if (ta.mo_document_path && fs.existsSync(ta.mo_document_path)) {
-        try { taMotkoi.mo_document = fs.readFileSync(ta.mo_document_path, 'utf8'); } catch {}
-      }
-      teamAgents.push({
-        id: ta.id, name: ta.agent_name, role: ta.role,
-        bot_token: ta.telegram_bot_token, bot_username: ta.telegram_bot_username,
-        motkoi: taMotkoi,
-      });
-    }
+    res.json({
+      success: true,
+      message: instantRestart
+        ? "Your agent has been updated and restarted instantly."
+        : "Updates queued — your agent will pick them up within 5 minutes."
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
 
-    const payload: any = {
-      env, service_keys: serviceKeys, motkoi: motkoiConfig, team_agents: teamAgents,
-      owner: {
-        telegram_id: owner.owner_chat_id || null,
-        name: owner.owner_name || userRows[0].name || userRows[0].email,
-        email: userRows[0].email,
-      },
-      queued_at: new Date().toISOString(),
-    };
+// POST /api/build-and-update — canonical build trigger, also accepts ?no_restart=true to skip SSH restart
+app.post("/api/build-and-update", authMiddleware, async (req, res) => {
+  try {
+    const { userId } = (req as any).user;
+    const payload = await buildUpdatePayload(userId);
+    if (!payload) return res.status(404).json({ error: "User not found" });
 
     await db.execute("UPDATE aba_deployments SET pending_build_at=NOW(), build_payload=? WHERE user_id=? ORDER BY id DESC LIMIT 1",
       [JSON.stringify(payload), userId]);
@@ -2635,21 +2610,84 @@ app.get("/api/build-and-update/status", authMiddleware, async (req, res) => {
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-// ==================== AGENT UPLOAD (for agent sync) ====================
+// Shared helper: gather all config into a build payload
+async function buildUpdatePayload(userId: number) {
+  const [userRows]: any = await db.execute("SELECT id, email, name FROM aba_users WHERE id=?", [userId]);
+  if (userRows.length === 0) return null;
+  const [cfgRows]: any = await db.execute("SELECT * FROM aba_agent_configs WHERE user_id=?", [userId]);
+  const [skRows]: any = await db.execute("SELECT service_name, credentials FROM aba_service_keys WHERE user_id=? AND is_active=1", [userId]);
+  const [depRows]: any = await db.execute("SELECT owner_chat_id, owner_name FROM aba_deployments WHERE user_id=? ORDER BY id DESC LIMIT 1", [userId]);
+  const [bizRows]: any = await db.execute("SELECT * FROM aba_businesses WHERE user_id=?", [userId]);
+  const [prodRows]: any = await db.execute("SELECT * FROM aba_products WHERE user_id=?", [userId]);
 
-const agentUpload = multer({ dest: path.join(uploadDir, 'agent'), limits: { fileSize: 50 * 1024 * 1024 } });
-app.post("/api/agent-upload", agentUpload.single('file'), async (req: any, res) => {
-  try {
-    const token = req.query.token || req.body.token;
-    if (token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: "Invalid token" });
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-    const newPath = path.join(path.dirname(req.file.path), req.file.originalname);
-    fs.renameSync(req.file.path, newPath);
-    res.json({ success: true, url: `/uploads/agent/${req.file.originalname}` });
-  } catch { res.status(500).json({ error: "Upload failed" }); }
-});
+  const cfg = cfgRows[0] || {};
+  const owner = depRows[0] || {};
 
-// ==================== AGENT SYNC ====================
+  const env: Record<string, string> = {};
+  if (cfg.email_pop_host) env.EMAIL_HOST = cfg.email_pop_host;
+  if (cfg.email_pop_port) env.EMAIL_PORT = String(cfg.email_pop_port);
+  if (cfg.email_pop_user) env.EMAIL_USER = cfg.email_pop_user;
+  if (cfg.email_pop_pass) env.EMAIL_PASS = cfg.email_pop_pass;
+  if (cfg.woo_url) env.WOO_URL = cfg.woo_url;
+  if (cfg.woo_key) env.WOO_KEY = cfg.woo_key;
+  if (cfg.woo_secret) env.WOO_SECRET = cfg.woo_secret;
+  if (cfg.shopify_url) env.SHOPIFY_URL = cfg.shopify_url;
+  if (cfg.shopify_api_key) env.SHOPIFY_API_KEY = cfg.shopify_api_key;
+  if (cfg.shopify_api_secret) env.SHOPIFY_API_SECRET = cfg.shopify_api_secret;
+  if (cfg.shopify_access_token) env.SHOPIFY_ACCESS_TOKEN = cfg.shopify_access_token;
+  if (cfg.db_connection_string) env.DB_CONNECTION_STRING = cfg.db_connection_string;
+  if (cfg.sh_store_id) env.SH_STORE_ID = cfg.sh_store_id;
+
+  const serviceKeys: Record<string, any> = {};
+  for (const sk of skRows) {
+    serviceKeys[sk.service_name] = typeof sk.credentials === 'string' ? JSON.parse(sk.credentials) : sk.credentials;
+  }
+
+  const motkoiConfig: Record<string, any> = {
+    mo: cfg.custom_greeting || '',
+    oi: cfg.custom_personality_text || cfg.personality || 'Professional',
+    timezone: cfg.timezone || 'Africa/Lagos',
+    nationality_vibe: cfg.nationality_vibe || 'Global',
+    tk: cfg.custom_instructions || '',
+  };
+  if (cfg.mo_document_path && fs.existsSync(cfg.mo_document_path)) {
+    try { motkoiConfig.mo_document = fs.readFileSync(cfg.mo_document_path, 'utf8'); } catch {}
+  }
+
+  const [teamRows]: any = await db.execute(`SELECT id, agent_name, role, telegram_bot_token, telegram_bot_username,
+    mo_content, oi_content, timezone, nationality_vibe, tk_content, mo_document_path, mo_document_name
+    FROM aba_team_agents WHERE user_id=? AND status='active'`, [userId]);
+  const teamAgents: any[] = [];
+  for (const ta of teamRows) {
+    const taMotkoi: any = {
+      mo: ta.mo_content || '',
+      oi: ta.oi_content || ta.role || 'Professional',
+      timezone: ta.timezone || 'Africa/Lagos',
+      nationality_vibe: ta.nationality_vibe || 'Global',
+      tk: ta.tk_content || '',
+    };
+    if (ta.mo_document_path && fs.existsSync(ta.mo_document_path)) {
+      try { taMotkoi.mo_document = fs.readFileSync(ta.mo_document_path, 'utf8'); } catch {}
+    }
+    teamAgents.push({
+      id: ta.id, name: ta.agent_name, role: ta.role,
+      bot_token: ta.telegram_bot_token, bot_username: ta.telegram_bot_username,
+      motkoi: taMotkoi,
+    });
+  }
+
+  return {
+    env, service_keys: serviceKeys, motkoi: motkoiConfig, team_agents: teamAgents,
+    business: bizRows[0] || null,
+    products: prodRows || [],
+    owner: {
+      telegram_id: owner.owner_chat_id || null,
+      name: owner.owner_name || userRows[0].name || userRows[0].email,
+      email: userRows[0].email,
+    },
+    queued_at: new Date().toISOString(),
+  };
+}
 
 app.get("/api/agent-sync", async (req, res) => {
   try {
