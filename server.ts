@@ -2558,14 +2558,16 @@ app.post("/api/agent-sync", authMiddleware, async (req, res) => {
     await db.execute("UPDATE aba_deployments SET pending_build_at=NOW(), build_payload=? WHERE user_id=? ORDER BY id DESC LIMIT 1",
       [JSON.stringify(payload), userId]);
 
-    // If we have an active EC2 instance, restart openclaw instantly so config takes effect NOW
+    // If we have an active EC2 instance, run the sync script FIRST to write IDENTITY.md, KNOWLEDGE.md, USER.md,
+    // then restart openclaw so it picks up the new files immediately.
     let instantRestart = false;
     if (dep && dep.public_ip) {
       try {
         const sshKey = process.env.SSH_KEY_PATH || "/root/.ssh/aba-agent-provision.pem";
+        const sshBase = `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ${sshKey} ubuntu@${dep.public_ip}`;
         const result = execSync(
-          `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ${sshKey} ubuntu@${dep.public_ip} "sudo systemctl restart openclaw 2>&1; sleep 3; sudo systemctl is-active openclaw" 2>/dev/null || true`,
-          { timeout: 20000 }
+          `${sshBase} "/usr/local/bin/aba-agent-sync 2>&1 || true; sudo systemctl restart openclaw 2>&1; sleep 3; sudo systemctl is-active openclaw" 2>/dev/null || true`,
+          { timeout: 30000 }
         ).toString().trim();
         if (result === "active") instantRestart = true;
       } catch {}
